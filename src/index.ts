@@ -14,7 +14,8 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { COMPANIONS, getCompanion, findTriggeredCompanion } from "./companions";
+import { Companion, SEED_COMPANIONS } from "./companions";
+import { renderDashboard } from "./dashboard";
 
 const DISCORD_API = 'https://discord.com/api/v10';
 
@@ -23,6 +24,7 @@ interface Env {
   DISCORD_TOKEN: string;
   WATCH_CHANNELS: string;
   WEBHOOK_URL: string;
+  DASHBOARD_TOKEN?: string;
 }
 
 interface PendingCommand {
@@ -83,7 +85,117 @@ export class CompanionBot extends McpAgent<Env> {
       channel_id TEXT PRIMARY KEY,
       last_message_id TEXT NOT NULL
     )`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS companions (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      avatar_url TEXT NOT NULL,
+      triggers TEXT NOT NULL,
+      human_name TEXT,
+      human_info TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`);
     this.dbReady = true;
+    this.seedCompanions();
+  }
+
+  // Seed companions from hardcoded data if table is empty
+  private seedCompanions() {
+    const count = this.ctx.storage.sql.exec(`SELECT COUNT(*) as cnt FROM companions`).toArray();
+    if ((count[0] as any).cnt > 0) return;
+
+    const now = Date.now();
+    for (const c of Object.values(SEED_COMPANIONS)) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO companions (id, name, avatar_url, triggers, human_name, human_info, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        c.id, c.name, c.avatar_url, JSON.stringify(c.triggers), c.human_name || null, c.human_info || null, now, now
+      );
+    }
+    console.log(`Seeded ${Object.keys(SEED_COMPANIONS).length} companions`);
+  }
+
+  // ===== Companion CRUD =====
+
+  getAllCompanions(): Companion[] {
+    this.ensureTable();
+    return this.ctx.storage.sql.exec(`SELECT * FROM companions ORDER BY created_at ASC`).toArray().map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      avatar_url: row.avatar_url,
+      triggers: JSON.parse(row.triggers),
+      human_name: row.human_name || undefined,
+      human_info: row.human_info || undefined,
+    }));
+  }
+
+  getCompanionById(id: string): Companion | undefined {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(`SELECT * FROM companions WHERE id = ?`, id).toArray();
+    if (rows.length === 0) return undefined;
+    const row = rows[0] as any;
+    return {
+      id: row.id,
+      name: row.name,
+      avatar_url: row.avatar_url,
+      triggers: JSON.parse(row.triggers),
+      human_name: row.human_name || undefined,
+      human_info: row.human_info || undefined,
+    };
+  }
+
+  createCompanion(data: { id: string; name: string; avatar_url: string; triggers: string[]; human_name?: string; human_info?: string }): Companion {
+    this.ensureTable();
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO companions (id, name, avatar_url, triggers, human_name, human_info, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      data.id, data.name, data.avatar_url, JSON.stringify(data.triggers), data.human_name || null, data.human_info || null, now, now
+    );
+    return { ...data };
+  }
+
+  updateCompanion(id: string, data: { name?: string; avatar_url?: string; triggers?: string[]; human_name?: string; human_info?: string }): Companion | undefined {
+    this.ensureTable();
+    const existing = this.getCompanionById(id);
+    if (!existing) return undefined;
+
+    const updated = {
+      name: data.name ?? existing.name,
+      avatar_url: data.avatar_url ?? existing.avatar_url,
+      triggers: data.triggers ?? existing.triggers,
+      human_name: data.human_name ?? existing.human_name,
+      human_info: data.human_info ?? existing.human_info,
+    };
+
+    this.ctx.storage.sql.exec(
+      `UPDATE companions SET name = ?, avatar_url = ?, triggers = ?, human_name = ?, human_info = ?, updated_at = ? WHERE id = ?`,
+      updated.name, updated.avatar_url, JSON.stringify(updated.triggers), updated.human_name || null, updated.human_info || null, Date.now(), id
+    );
+
+    return { id, ...updated };
+  }
+
+  deleteCompanion(id: string): boolean {
+    this.ensureTable();
+    const existing = this.getCompanionById(id);
+    if (!existing) return false;
+    this.ctx.storage.sql.exec(`DELETE FROM companions WHERE id = ?`, id);
+    return true;
+  }
+
+  // Dynamic versions of companion helpers (read from SQLite)
+  findTriggeredCompanionDynamic(content: string): Companion[] {
+    const all = this.getAllCompanions();
+    const lower = content.toLowerCase();
+    const matched: Companion[] = [];
+    for (const companion of all) {
+      for (const trigger of companion.triggers) {
+        if (lower.includes(trigger.toLowerCase())) {
+          matched.push(companion);
+          break;
+        }
+      }
+    }
+    return matched;
   }
 
   private getCursor(channelId: string): string | null {
@@ -161,6 +273,101 @@ export class CompanionBot extends McpAgent<Env> {
       });
     }
 
+    // ===== Companion API routes =====
+
+    if (url.pathname === '/api/companions' && request.method === 'GET') {
+      const companions = this.getAllCompanions();
+      return new Response(JSON.stringify(companions, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Match /api/companions/:id
+    const companionMatch = url.pathname.match(/^\/api\/companions\/([^/]+)$/);
+
+    if (companionMatch && request.method === 'GET') {
+      const companion = this.getCompanionById(companionMatch[1]);
+      if (!companion) {
+        return new Response(JSON.stringify({ error: 'Not found' }), {
+          status: 404, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify(companion), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (url.pathname === '/api/companions' && request.method === 'POST') {
+      try {
+        const body = await request.json() as any;
+        if (!body.name || !body.avatar_url || !body.triggers) {
+          return new Response(JSON.stringify({ error: 'name, avatar_url, and triggers are required' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const id = body.id || body.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-');
+        const triggers = Array.isArray(body.triggers) ? body.triggers : body.triggers.split(',').map((t: string) => t.trim());
+        const companion = this.createCompanion({
+          id, name: body.name, avatar_url: body.avatar_url, triggers,
+          human_name: body.human_name, human_info: body.human_info,
+        });
+        return new Response(JSON.stringify(companion), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    if (companionMatch && request.method === 'PUT') {
+      try {
+        const body = await request.json() as any;
+        if (body.triggers && !Array.isArray(body.triggers)) {
+          body.triggers = body.triggers.split(',').map((t: string) => t.trim());
+        }
+        const updated = this.updateCompanion(companionMatch[1], body);
+        if (!updated) {
+          return new Response(JSON.stringify({ error: 'Not found' }), {
+            status: 404, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify(updated), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    if (companionMatch && request.method === 'DELETE') {
+      const deleted = this.deleteCompanion(companionMatch[1]);
+      if (!deleted) {
+        return new Response(JSON.stringify({ error: 'Not found' }), {
+          status: 404, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ deleted: companionMatch[1] }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Status endpoint
+    if (url.pathname === '/api/status' && request.method === 'GET') {
+      const pending = this.getPending();
+      const companions = this.getAllCompanions();
+      return new Response(JSON.stringify({
+        pending_count: pending.length,
+        companion_count: companions.length,
+        watch_channels: (this.env.WATCH_CHANNELS || '').split(',').filter(Boolean),
+      }, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
     return super.fetch(request);
   }
 
@@ -175,7 +382,7 @@ export class CompanionBot extends McpAgent<Env> {
         webhook_url?: string;
       };
 
-      const companion = getCompanion(body.companion_id);
+      const companion = this.getCompanionById(body.companion_id);
       if (!companion) {
         return new Response(JSON.stringify({ error: `Unknown companion: ${body.companion_id}` }), {
           status: 400,
@@ -219,7 +426,7 @@ export class CompanionBot extends McpAgent<Env> {
     const pending = this.getPending().map(cmd => ({
       id: cmd.id,
       companion_id: cmd.companion_id,
-      companion_name: getCompanion(cmd.companion_id)?.name,
+      companion_name: this.getCompanionById(cmd.companion_id)?.name,
       content: cmd.content,
       author: cmd.author,
       channel_id: cmd.channel_id,
@@ -286,7 +493,7 @@ export class CompanionBot extends McpAgent<Env> {
           // Skip empty messages
           if (!msg.content) continue;
 
-          const triggered = findTriggeredCompanion(msg.content);
+          const triggered = this.findTriggeredCompanionDynamic(msg.content);
           if (triggered.length === 0) continue;
 
           // Store a pending command for each triggered companion
@@ -365,7 +572,9 @@ export class CompanionBot extends McpAgent<Env> {
           return { content: [{ type: "text" as const, text: `No pending command with ID: ${requestId}` }] };
         }
 
-        const companion = getCompanion(command.companion_id);
+        // Fetch companion from the default DO's SQLite
+        const companionRes = await stub.fetch(new Request(`https://internal/api/companions/${command.companion_id}`));
+        const companion = companionRes.ok ? await companionRes.json() as Companion : null;
         if (!companion) {
           return { content: [{ type: "text" as const, text: `Unknown companion: ${command.companion_id}` }] };
         }
@@ -425,7 +634,9 @@ export class CompanionBot extends McpAgent<Env> {
         webhookUrl: z.string().optional().describe("Discord webhook URL. If omitted, uses default WEBHOOK_URL."),
       },
       async ({ content, companionId, webhookUrl }) => {
-        const companion = getCompanion(companionId);
+        const stub = getDefaultStub();
+        const cRes = await stub.fetch(new Request(`https://internal/api/companions/${companionId}`));
+        const companion = cRes.ok ? await cRes.json() as Companion : null;
         if (!companion) {
           return { content: [{ type: "text" as const, text: `Unknown companion: ${companionId}` }] };
         }
@@ -459,10 +670,14 @@ export class CompanionBot extends McpAgent<Env> {
       "List all available companions and their trigger words",
       {},
       async () => {
-        const list = Object.values(COMPANIONS).map(c => ({
+        const stub = getDefaultStub();
+        const res = await stub.fetch(new Request('https://internal/api/companions'));
+        const companions = await res.json() as Companion[];
+        const list = companions.map(c => ({
           id: c.id,
           name: c.name,
           triggers: c.triggers,
+          human_name: c.human_name,
         }));
         return { content: [{ type: "text" as const, text: JSON.stringify(list, null, 2) }] };
       }
@@ -1032,10 +1247,18 @@ export default {
         status: 'ok',
         service: 'discord-companion-bot',
         version: '1.0.0',
-        companions: Object.keys(COMPANIONS),
-        features: ['mcp', 'sse', 'trigger', 'webhook-dispatch', 'cron-poll'],
+        companions: Object.keys(SEED_COMPANIONS),
+        features: ['mcp', 'sse', 'trigger', 'webhook-dispatch', 'cron-poll', 'dashboard'],
       }, null, 2), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // Dashboard
+    if (url.pathname === '/dashboard') {
+      const baseUrl = url.origin;
+      return new Response(renderDashboard(baseUrl), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
       });
     }
 
@@ -1051,6 +1274,31 @@ export default {
       const id = env.COMPANION_BOT.idFromName('default');
       const stub = env.COMPANION_BOT.get(id);
       return stub.fetch(request);
+    }
+
+    // API routes — proxy to default DO
+    if (url.pathname.startsWith('/api/')) {
+      // Auth check for write operations
+      if (request.method !== 'GET' && env.DASHBOARD_TOKEN) {
+        const auth = request.headers.get('Authorization');
+        if (auth !== `Bearer ${env.DASHBOARD_TOKEN}`) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+      }
+
+      const id = env.COMPANION_BOT.idFromName('default');
+      const stub = env.COMPANION_BOT.get(id);
+      const doRes = await stub.fetch(new Request(`https://internal${url.pathname}${url.search}`, {
+        method: request.method,
+        headers: request.headers,
+        body: request.method !== 'GET' ? request.body : undefined,
+      }));
+      // Add CORS headers to the response
+      const res = new Response(doRes.body, doRes);
+      Object.entries(corsHeaders).forEach(([k, v]) => res.headers.set(k, v));
+      return res;
     }
 
     // SSE endpoint
@@ -1078,12 +1326,14 @@ export default {
       service: 'Discord Companion Bot',
       endpoints: {
         health: 'GET /',
+        dashboard: 'GET /dashboard',
+        api: 'GET /api/companions',
         trigger: 'POST /trigger',
         pending: 'GET /pending',
         mcp: '/mcp',
         sse: '/sse',
       },
-      companions: Object.values(COMPANIONS).map(c => `${c.name} (${c.triggers.join(', ')})`),
+      companions: Object.values(SEED_COMPANIONS).map(c => `${c.name} (${c.triggers.join(', ')})`),
     }, null, 2), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
     });
