@@ -1,0 +1,25 @@
+name = "discord-companion-bot"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "COMPANION_BOT"
+class_name = "CompanionBot"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CompanionBot"]
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+WATCH_CHANNELS = "1450789790906712066,1462682277980016742"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1475791794292785183/CNz4-37BTVabKLTAilXawGhrXnGhr5BB2ny4yqzr7YJiM4dJtnqiMfOr1g_5ec3X6sKq"
+
+# Secrets (set via `wrangler secret put`):
+# - DISCORD_TOKEN: Bot token (already set)
