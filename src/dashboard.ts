@@ -42,6 +42,35 @@ export function renderDashboard(baseUrl: string): string {
     .modal-backdrop {
       backdrop-filter: blur(4px);
     }
+    /* Cropper styles */
+    .crop-area {
+      position: relative;
+      width: 280px;
+      height: 280px;
+      overflow: hidden;
+      border-radius: 50%;
+      cursor: grab;
+      background: #1E1F22;
+    }
+    .crop-area:active { cursor: grabbing; }
+    .crop-area img {
+      position: absolute;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .crop-container {
+      position: relative;
+      width: 280px;
+      height: 280px;
+    }
+    .crop-ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 3px solid rgba(88, 101, 242, 0.6);
+      pointer-events: none;
+      z-index: 2;
+    }
   </style>
 </head>
 <body class="bg-discord-darker text-gray-100 min-h-screen">
@@ -73,11 +102,17 @@ export function renderDashboard(baseUrl: string): string {
   </header>
 
   <!-- Status Bar -->
-  <div class="bg-discord-dark/50 border-b border-gray-700/30 px-6 py-2">
-    <div class="max-w-6xl mx-auto flex items-center gap-6 text-sm text-gray-400">
-      <span id="companionCount">-- companions</span>
-      <span id="pendingCount">-- pending</span>
-      <span id="channelCount">-- channels watched</span>
+  <div class="bg-discord-dark/50 border-b border-gray-700/30 px-6 py-3">
+    <div class="max-w-6xl mx-auto">
+      <div class="flex items-center gap-6 text-sm text-gray-400">
+        <span id="companionCount">-- companions</span>
+        <span id="pendingCount">-- pending</span>
+      </div>
+      <!-- Servers & Channels -->
+      <div id="serverInfo" class="mt-2 hidden">
+        <div class="flex flex-wrap gap-3" id="serverList"></div>
+        <div class="flex flex-wrap gap-2 mt-2" id="channelList"></div>
+      </div>
     </div>
   </div>
 
@@ -95,8 +130,8 @@ export function renderDashboard(baseUrl: string): string {
   </main>
 
   <!-- Register / Edit Modal -->
-  <div id="modal" class="fixed inset-0 bg-black/60 modal-backdrop hidden z-50 flex items-center justify-center p-4">
-    <div class="bg-discord-card rounded-xl shadow-2xl w-full max-w-lg border border-gray-700/50">
+  <div id="modal" class="fixed inset-0 bg-black/60 modal-backdrop hidden z-50 flex items-center justify-center p-4 overflow-y-auto">
+    <div class="bg-discord-card rounded-xl shadow-2xl w-full max-w-lg border border-gray-700/50 my-auto max-h-[90vh] flex flex-col">
       <div class="flex items-center justify-between px-6 py-4 border-b border-gray-700/50">
         <h2 id="modalTitle" class="text-lg font-semibold">Register Companion</h2>
         <button onclick="closeModal()" class="text-gray-400 hover:text-white transition-colors">
@@ -104,14 +139,19 @@ export function renderDashboard(baseUrl: string): string {
         </button>
       </div>
 
-      <form id="companionForm" onsubmit="handleSubmit(event)" class="p-6 space-y-4">
+      <form id="companionForm" onsubmit="handleSubmit(event)" class="p-6 space-y-4 overflow-y-auto">
         <input type="hidden" id="editId" value="">
 
-        <!-- Avatar Preview -->
-        <div class="flex justify-center">
-          <div class="relative">
-            <img id="avatarPreview" src="https://cdn.discordapp.com/embed/avatars/0.png" class="w-20 h-20 rounded-full object-cover border-2 border-gray-600 avatar-preview" alt="Avatar preview">
+        <!-- Avatar Preview + Upload -->
+        <div class="flex flex-col items-center gap-2">
+          <div class="relative group cursor-pointer" onclick="document.getElementById('avatarFileInput').click()">
+            <img id="avatarPreview" src="https://cdn.discordapp.com/embed/avatars/0.png" referrerpolicy="no-referrer" class="w-20 h-20 rounded-full object-cover border-2 border-gray-600" alt="Avatar">
+            <div class="absolute inset-0 rounded-full bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+              <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+            </div>
+            <input type="file" id="avatarFileInput" accept="image/*" class="hidden" onchange="openCropper(this)">
           </div>
+          <p class="text-xs text-gray-500">Click to upload</p>
         </div>
 
         <!-- Name -->
@@ -121,12 +161,17 @@ export function renderDashboard(baseUrl: string): string {
             class="w-full bg-discord-input border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-discord">
         </div>
 
-        <!-- Avatar URL -->
+        <!-- Avatar URL (hidden but still used) -->
+        <input type="hidden" id="inputAvatar" value="">
+
+        <!-- Avatar URL manual fallback -->
         <div>
-          <label class="block text-sm font-medium text-gray-300 mb-1">Avatar URL *</label>
-          <input type="url" id="inputAvatar" required placeholder="https://..."
-            class="w-full bg-discord-input border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-discord"
-            oninput="previewAvatar(this.value)">
+          <button type="button" onclick="toggleUrlInput()" class="text-xs text-gray-500 hover:text-gray-300 transition-colors">Or paste avatar URL manually</button>
+          <div id="urlInputRow" class="hidden mt-2">
+            <input type="url" id="inputAvatarUrl" placeholder="https://..."
+              class="w-full bg-discord-input border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-discord text-sm"
+              oninput="document.getElementById('inputAvatar').value = this.value; previewAvatar(this.value)">
+          </div>
         </div>
 
         <!-- Trigger Words -->
@@ -179,6 +224,30 @@ export function renderDashboard(baseUrl: string): string {
     </div>
   </div>
 
+  <!-- Crop Modal -->
+  <div id="cropModal" class="fixed inset-0 bg-black/80 modal-backdrop hidden z-[60] flex items-center justify-center p-4">
+    <div class="bg-discord-card rounded-xl shadow-2xl border border-gray-700/50 p-6 flex flex-col items-center gap-4">
+      <h2 class="text-lg font-semibold">Position Avatar</h2>
+      <p class="text-sm text-gray-400">Drag to reposition. Scroll to zoom.</p>
+      <div class="crop-container">
+        <div class="crop-area" id="cropArea">
+          <img id="cropImage" src="" alt="Crop">
+        </div>
+        <div class="crop-ring"></div>
+      </div>
+      <!-- Zoom slider -->
+      <div class="flex items-center gap-3 w-full max-w-[280px]">
+        <svg class="w-4 h-4 text-gray-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM13 10H7"/></svg>
+        <input type="range" id="cropZoom" min="100" max="400" value="100" class="flex-1 accent-[#5865F2]" oninput="updateCropZoom(this.value)">
+        <svg class="w-4 h-4 text-gray-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m3-3H7"/></svg>
+      </div>
+      <div class="flex gap-3">
+        <button onclick="closeCropper()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">Cancel</button>
+        <button onclick="applyCrop()" class="bg-discord hover:bg-discord/80 text-white px-6 py-2 rounded-lg text-sm font-medium transition-colors">Crop & Upload</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const API = '${baseUrl}/api';
     let companions = [];
@@ -202,7 +271,28 @@ export function renderDashboard(baseUrl: string): string {
         const status = await res.json();
         document.getElementById('companionCount').textContent = status.companion_count + ' companions';
         document.getElementById('pendingCount').textContent = status.pending_count + ' pending';
-        document.getElementById('channelCount').textContent = status.watch_channels.length + ' channels watched';
+
+        // Render servers
+        const serverInfo = document.getElementById('serverInfo');
+        const serverList = document.getElementById('serverList');
+        const channelList = document.getElementById('channelList');
+
+        if (status.servers && status.servers.length > 0) {
+          serverInfo.classList.remove('hidden');
+          serverList.innerHTML = status.servers.map(s => \`
+            <div class="flex items-center gap-2 bg-discord-card rounded-lg px-3 py-1.5 border border-gray-700/50">
+              \${s.icon ? \`<img src="\${s.icon}" class="w-5 h-5 rounded-full" referrerpolicy="no-referrer">\` : \`<div class="w-5 h-5 rounded-full bg-discord-hover flex items-center justify-center text-xs">\${s.name[0]}</div>\`}
+              <span class="text-sm text-gray-300">\${s.name}</span>
+            </div>
+          \`).join('');
+        }
+
+        if (status.watch_channels && status.watch_channels.length > 0) {
+          channelList.innerHTML = '<span class="text-xs text-gray-500 mr-1">Watching:</span>' +
+            status.watch_channels.map(ch => \`
+              <span class="text-xs bg-discord/10 text-discord border border-discord/20 rounded-full px-2.5 py-0.5">#\${ch.name || ch.id}</span>
+            \`).join('');
+        }
       } catch (err) {}
     }
 
@@ -222,7 +312,7 @@ export function renderDashboard(baseUrl: string): string {
       grid.innerHTML = companions.map(c => \`
         <div class="bg-discord-card rounded-xl border border-gray-700/50 p-5 hover:border-discord/30 transition-colors">
           <div class="flex items-start gap-4">
-            <img src="\${c.avatar_url}" alt="\${c.name}" class="w-14 h-14 rounded-full object-cover border-2 border-gray-600 flex-shrink-0"
+            <img src="\${c.avatar_url}" alt="\${c.name}" referrerpolicy="no-referrer" crossorigin="anonymous" class="w-14 h-14 rounded-full object-cover border-2 border-gray-600 flex-shrink-0"
               onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
             <div class="flex-1 min-w-0">
               <h3 class="font-semibold text-white truncate">\${c.name}</h3>
@@ -250,7 +340,10 @@ export function renderDashboard(baseUrl: string): string {
     function openModal() {
       document.getElementById('editId').value = '';
       document.getElementById('companionForm').reset();
+      document.getElementById('inputAvatar').value = '';
+      document.getElementById('inputAvatarUrl').value = '';
       document.getElementById('avatarPreview').src = 'https://cdn.discordapp.com/embed/avatars/0.png';
+      document.getElementById('urlInputRow').classList.add('hidden');
       document.getElementById('modalTitle').textContent = 'Register Companion';
       document.getElementById('submitText').textContent = 'Register';
       document.getElementById('deleteBtn').classList.add('hidden');
@@ -264,6 +357,7 @@ export function renderDashboard(baseUrl: string): string {
       document.getElementById('editId').value = c.id;
       document.getElementById('inputName').value = c.name;
       document.getElementById('inputAvatar').value = c.avatar_url;
+      document.getElementById('inputAvatarUrl').value = c.avatar_url;
       document.getElementById('inputTriggers').value = c.triggers.join(', ');
       document.getElementById('inputHumanName').value = c.human_name || '';
       document.getElementById('inputHumanInfo').value = c.human_info || '';
@@ -278,12 +372,142 @@ export function renderDashboard(baseUrl: string): string {
       document.getElementById('modal').classList.add('hidden');
     }
 
+    // ===== Cropper State =====
+    let cropState = { x: 0, y: 0, zoom: 100, dragging: false, startX: 0, startY: 0, imgW: 0, imgH: 0 };
+
+    function openCropper(input) {
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = document.getElementById('cropImage');
+        img.onload = () => {
+          // Fit image to cover the 280px circle
+          const areaSize = 280;
+          const scale = Math.max(areaSize / img.naturalWidth, areaSize / img.naturalHeight);
+          cropState.imgW = img.naturalWidth * scale;
+          cropState.imgH = img.naturalHeight * scale;
+          cropState.zoom = 100;
+          cropState.x = (areaSize - cropState.imgW) / 2;
+          cropState.y = (areaSize - cropState.imgH) / 2;
+          document.getElementById('cropZoom').value = 100;
+          updateCropPosition();
+          document.getElementById('cropModal').classList.remove('hidden');
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function updateCropPosition() {
+      const img = document.getElementById('cropImage');
+      const z = cropState.zoom / 100;
+      img.style.width = (cropState.imgW * z) + 'px';
+      img.style.height = (cropState.imgH * z) + 'px';
+      img.style.left = cropState.x + 'px';
+      img.style.top = cropState.y + 'px';
+    }
+
+    function updateCropZoom(val) {
+      const oldZ = cropState.zoom / 100;
+      const newZ = val / 100;
+      // Zoom toward center
+      const cx = 140, cy = 140;
+      cropState.x = cx - (cx - cropState.x) * (newZ / oldZ);
+      cropState.y = cy - (cy - cropState.y) * (newZ / oldZ);
+      cropState.zoom = val;
+      updateCropPosition();
+    }
+
+    // Drag handlers
+    const cropArea = document.getElementById('cropArea');
+    cropArea.addEventListener('pointerdown', (e) => {
+      cropState.dragging = true;
+      cropState.startX = e.clientX - cropState.x;
+      cropState.startY = e.clientY - cropState.y;
+      cropArea.setPointerCapture(e.pointerId);
+    });
+    cropArea.addEventListener('pointermove', (e) => {
+      if (!cropState.dragging) return;
+      cropState.x = e.clientX - cropState.startX;
+      cropState.y = e.clientY - cropState.startY;
+      updateCropPosition();
+    });
+    cropArea.addEventListener('pointerup', () => { cropState.dragging = false; });
+
+    // Scroll to zoom
+    cropArea.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const slider = document.getElementById('cropZoom');
+      let newVal = cropState.zoom + (e.deltaY > 0 ? -10 : 10);
+      newVal = Math.max(100, Math.min(400, newVal));
+      slider.value = newVal;
+      updateCropZoom(newVal);
+    }, { passive: false });
+
+    function closeCropper() {
+      document.getElementById('cropModal').classList.add('hidden');
+      document.getElementById('avatarFileInput').value = '';
+    }
+
+    async function applyCrop() {
+      // Draw cropped area to canvas
+      const canvas = document.createElement('canvas');
+      const size = 256; // Output avatar size
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      const img = document.getElementById('cropImage');
+      const z = cropState.zoom / 100;
+      const areaSize = 280;
+
+      // Map crop area coordinates to source image coordinates
+      const srcX = -cropState.x / (cropState.imgW * z) * img.naturalWidth;
+      const srcY = -cropState.y / (cropState.imgH * z) * img.naturalHeight;
+      const srcSize = areaSize / (cropState.imgW * z) * img.naturalWidth;
+
+      ctx.drawImage(img, srcX, srcY, srcSize, srcSize, 0, 0, size, size);
+
+      // Convert to blob and upload
+      canvas.toBlob(async (blob) => {
+        if (!blob) return;
+
+        // Show preview immediately
+        const previewUrl = URL.createObjectURL(blob);
+        document.getElementById('avatarPreview').src = previewUrl;
+        closeCropper();
+
+        // Upload
+        try {
+          const formData = new FormData();
+          formData.append('file', blob, 'avatar.png');
+          const res = await fetch(API.replace('/api', '') + '/upload-avatar', {
+            method: 'POST',
+            body: formData,
+          });
+          if (!res.ok) {
+            const err = await res.text();
+            throw new Error(err);
+          }
+          const data = await res.json();
+          document.getElementById('inputAvatar').value = data.url;
+        } catch (err) {
+          alert('Upload failed: ' + err.message);
+        }
+      }, 'image/png');
+    }
+
     function previewAvatar(url) {
       const img = document.getElementById('avatarPreview');
       if (url) {
         img.src = url;
         img.onerror = () => { img.src = 'https://cdn.discordapp.com/embed/avatars/0.png'; };
       }
+    }
+
+    function toggleUrlInput() {
+      const row = document.getElementById('urlInputRow');
+      row.classList.toggle('hidden');
     }
 
     // Auth
@@ -308,9 +532,14 @@ export function renderDashboard(baseUrl: string): string {
     async function handleSubmit(e) {
       e.preventDefault();
       const editId = document.getElementById('editId').value;
+      const avatarUrl = document.getElementById('inputAvatar').value.trim();
+      if (!avatarUrl) {
+        alert('Please upload an avatar image or paste a URL.');
+        return;
+      }
       const data = {
         name: document.getElementById('inputName').value.trim(),
-        avatar_url: document.getElementById('inputAvatar').value.trim(),
+        avatar_url: avatarUrl,
         triggers: document.getElementById('inputTriggers').value.split(',').map(t => t.trim()).filter(Boolean),
         human_name: document.getElementById('inputHumanName').value.trim() || undefined,
         human_info: document.getElementById('inputHumanInfo').value.trim() || undefined,

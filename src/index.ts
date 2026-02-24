@@ -85,6 +85,12 @@ export class CompanionBot extends McpAgent<Env> {
       channel_id TEXT PRIMARY KEY,
       last_message_id TEXT NOT NULL
     )`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS avatars (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      content_type TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS companions (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -273,6 +279,55 @@ export class CompanionBot extends McpAgent<Env> {
       });
     }
 
+    // ===== Avatar upload/serve =====
+
+    if (url.pathname === '/upload-avatar' && request.method === 'POST') {
+      try {
+        this.ensureTable();
+        const formData = await request.formData();
+        const file = formData.get('file') as File;
+        if (!file) {
+          return new Response(JSON.stringify({ error: 'No file provided' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const buffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i += 8192) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+        }
+        const base64 = btoa(binary);
+        const id = crypto.randomUUID();
+        this.ctx.storage.sql.exec(
+          `INSERT INTO avatars (id, data, content_type, created_at) VALUES (?, ?, ?, ?)`,
+          id, base64, file.type || 'image/png', Date.now()
+        );
+        const avatarUrl = `${request.headers.get('origin') || url.origin}/avatars/${id}`;
+        return new Response(JSON.stringify({ url: avatarUrl, id }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    const avatarMatch = url.pathname.match(/^\/avatars\/([^/]+)$/);
+    if (avatarMatch && request.method === 'GET') {
+      this.ensureTable();
+      const rows = this.ctx.storage.sql.exec(`SELECT data, content_type FROM avatars WHERE id = ?`, avatarMatch[1]).toArray();
+      if (rows.length === 0) {
+        return new Response('Not found', { status: 404 });
+      }
+      const row = rows[0] as any;
+      const bytes = Uint8Array.from(atob(row.data), c => c.charCodeAt(0));
+      return new Response(bytes, {
+        headers: { 'Content-Type': row.content_type, 'Cache-Control': 'public, max-age=31536000' },
+      });
+    }
+
     // ===== Companion API routes =====
 
     if (url.pathname === '/api/companions' && request.method === 'GET') {
@@ -355,14 +410,45 @@ export class CompanionBot extends McpAgent<Env> {
       });
     }
 
-    // Status endpoint
+    // Status endpoint — includes server/channel info
     if (url.pathname === '/api/status' && request.method === 'GET') {
       const pending = this.getPending();
       const companions = this.getAllCompanions();
+      const watchChannels = (this.env.WATCH_CHANNELS || '').split(',').filter(Boolean);
+
+      // Fetch server list and channel names
+      let servers: any[] = [];
+      let channelDetails: any[] = [];
+      try {
+        const guildsResult = await discordRequest(this.env, '/users/@me/guilds');
+        if (!guildsResult.error) {
+          servers = (guildsResult as any[]).map((g: any) => ({
+            id: g.id,
+            name: g.name,
+            icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.webp?size=64` : null,
+          }));
+        }
+      } catch (_) {}
+
+      // Fetch channel info for watched channels
+      for (const chId of watchChannels) {
+        try {
+          const ch = await discordRequest(this.env, `/channels/${chId}`);
+          if (!ch.error) {
+            channelDetails.push({
+              id: ch.id,
+              name: ch.name,
+              guild_id: ch.guild_id,
+            });
+          }
+        } catch (_) {}
+      }
+
       return new Response(JSON.stringify({
         pending_count: pending.length,
         companion_count: companions.length,
-        watch_channels: (this.env.WATCH_CHANNELS || '').split(',').filter(Boolean),
+        watch_channels: channelDetails,
+        servers,
       }, null, 2), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -1233,7 +1319,7 @@ export default {
     const url = new URL(request.url);
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id',
     };
 
@@ -1274,6 +1360,27 @@ export default {
       const id = env.COMPANION_BOT.idFromName('default');
       const stub = env.COMPANION_BOT.get(id);
       return stub.fetch(request);
+    }
+
+    // Avatar upload — proxy to default DO
+    if (url.pathname === '/upload-avatar' && request.method === 'POST') {
+      const id = env.COMPANION_BOT.idFromName('default');
+      const stub = env.COMPANION_BOT.get(id);
+      const doRes = await stub.fetch(new Request(`https://internal/upload-avatar`, {
+        method: 'POST',
+        headers: request.headers,
+        body: request.body,
+      }));
+      const res = new Response(doRes.body, doRes);
+      Object.entries(corsHeaders).forEach(([k, v]) => res.headers.set(k, v));
+      return res;
+    }
+
+    // Avatar serve — proxy to default DO
+    if (url.pathname.startsWith('/avatars/')) {
+      const id = env.COMPANION_BOT.idFromName('default');
+      const stub = env.COMPANION_BOT.get(id);
+      return stub.fetch(new Request(`https://internal${url.pathname}`, { method: 'GET' }));
     }
 
     // API routes — proxy to default DO
