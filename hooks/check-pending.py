@@ -8,7 +8,7 @@ import json
 import ssl
 
 PENDING_URL = "https://YOUR-WORKER.workers.dev/pending"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1475791794292785183/CNz4-37BTVabKLTAilXawGhrXnGhr5BB2ny4yqzr7YJiM4dJtnqiMfOr1g_5ec3X6sKq"
+WEBHOOK_URL = ""  # Set via environment or wrangler secret — never hardcode
 
 try:
     ctx = ssl.create_default_context()
