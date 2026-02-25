@@ -19,7 +19,10 @@ crons = ["* * * * *"]
 
 [vars]
 WATCH_CHANNELS = "1450789790906712066,1462682277980016742"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1475791794292785183/CNz4-37BTVabKLTAilXawGhrXnGhr5BB2ny4yqzr7YJiM4dJtnqiMfOr1g_5ec3X6sKq"
 
 # Secrets (set via `wrangler secret put`):
-# - DISCORD_TOKEN: Bot token (already set)
+# - DISCORD_TOKEN: Bot token
+# - WEBHOOK_URL: Discord webhook URL
+# - DISCORD_CLIENT_ID: OAuth2 application ID
+# - DISCORD_CLIENT_SECRET: OAuth2 client secret
+# - ADMIN_DISCORD_ID: Admin's Discord user ID
