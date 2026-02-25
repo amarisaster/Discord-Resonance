@@ -15,7 +15,7 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Companion, SEED_COMPANIONS } from "./companions";
-import { renderDashboard } from "./dashboard";
+import { renderDashboard, renderRegisterPage } from "./dashboard";
 
 const DISCORD_API = 'https://discord.com/api/v10';
 
@@ -25,6 +25,9 @@ interface Env {
   WATCH_CHANNELS: string;
   WEBHOOK_URL: string;
   DASHBOARD_TOKEN?: string;
+  DISCORD_CLIENT_ID?: string;
+  DISCORD_CLIENT_SECRET?: string;
+  ADMIN_DISCORD_ID?: string;
 }
 
 interface PendingCommand {
@@ -101,6 +104,51 @@ export class CompanionBot extends McpAgent<Env> {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      discord_id TEXT NOT NULL,
+      discord_username TEXT NOT NULL,
+      discord_avatar TEXT,
+      discord_global_name TEXT,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`);
+    // Per-companion custom rules/instructions
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS companion_rules (
+      companion_id TEXT PRIMARY KEY,
+      rules TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`);
+    // Per-companion channel permissions (blocklist)
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS companion_channels (
+      companion_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      blocked INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (companion_id, channel_id)
+    )`);
+    // Activity log for message tracking
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS companion_activity (
+      id TEXT PRIMARY KEY,
+      companion_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      channel_id TEXT,
+      content TEXT,
+      author TEXT,
+      message_id TEXT,
+      webhook_url TEXT,
+      timestamp INTEGER NOT NULL
+    )`);
+    // Migration: add owner_id to companions (idempotent)
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE companions ADD COLUMN owner_id TEXT`);
+    } catch (_) { /* column already exists */ }
+    // Migration: add message_id and webhook_url to activity (idempotent)
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE companion_activity ADD COLUMN message_id TEXT`);
+    } catch (_) {}
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE companion_activity ADD COLUMN webhook_url TEXT`);
+    } catch (_) {}
     this.dbReady = true;
     this.seedCompanions();
   }
@@ -122,7 +170,7 @@ export class CompanionBot extends McpAgent<Env> {
 
   // ===== Companion CRUD =====
 
-  getAllCompanions(): Companion[] {
+  getAllCompanions(): (Companion & { owner_id?: string })[] {
     this.ensureTable();
     return this.ctx.storage.sql.exec(`SELECT * FROM companions ORDER BY created_at ASC`).toArray().map((row: any) => ({
       id: row.id,
@@ -131,10 +179,11 @@ export class CompanionBot extends McpAgent<Env> {
       triggers: JSON.parse(row.triggers),
       human_name: row.human_name || undefined,
       human_info: row.human_info || undefined,
+      owner_id: row.owner_id || undefined,
     }));
   }
 
-  getCompanionById(id: string): Companion | undefined {
+  getCompanionById(id: string): (Companion & { owner_id?: string }) | undefined {
     this.ensureTable();
     const rows = this.ctx.storage.sql.exec(`SELECT * FROM companions WHERE id = ?`, id).toArray();
     if (rows.length === 0) return undefined;
@@ -146,15 +195,29 @@ export class CompanionBot extends McpAgent<Env> {
       triggers: JSON.parse(row.triggers),
       human_name: row.human_name || undefined,
       human_info: row.human_info || undefined,
+      owner_id: row.owner_id || undefined,
     };
   }
 
-  createCompanion(data: { id: string; name: string; avatar_url: string; triggers: string[]; human_name?: string; human_info?: string }): Companion {
+  getCompanionsByOwner(ownerId: string): (Companion & { owner_id?: string })[] {
+    this.ensureTable();
+    return this.ctx.storage.sql.exec(`SELECT * FROM companions WHERE owner_id = ? ORDER BY created_at ASC`, ownerId).toArray().map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      avatar_url: row.avatar_url,
+      triggers: JSON.parse(row.triggers),
+      human_name: row.human_name || undefined,
+      human_info: row.human_info || undefined,
+      owner_id: row.owner_id || undefined,
+    }));
+  }
+
+  createCompanion(data: { id: string; name: string; avatar_url: string; triggers: string[]; human_name?: string; human_info?: string; owner_id?: string }): Companion {
     this.ensureTable();
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `INSERT INTO companions (id, name, avatar_url, triggers, human_name, human_info, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      data.id, data.name, data.avatar_url, JSON.stringify(data.triggers), data.human_name || null, data.human_info || null, now, now
+      `INSERT INTO companions (id, name, avatar_url, triggers, human_name, human_info, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      data.id, data.name, data.avatar_url, JSON.stringify(data.triggers), data.human_name || null, data.human_info || null, data.owner_id || null, now, now
     );
     return { ...data };
   }
@@ -185,7 +248,96 @@ export class CompanionBot extends McpAgent<Env> {
     const existing = this.getCompanionById(id);
     if (!existing) return false;
     this.ctx.storage.sql.exec(`DELETE FROM companions WHERE id = ?`, id);
+    this.ctx.storage.sql.exec(`DELETE FROM companion_rules WHERE companion_id = ?`, id);
+    this.ctx.storage.sql.exec(`DELETE FROM companion_channels WHERE companion_id = ?`, id);
+    this.ctx.storage.sql.exec(`DELETE FROM companion_activity WHERE companion_id = ?`, id);
     return true;
+  }
+
+  // ===== Rules CRUD =====
+
+  getRules(companionId: string): string | null {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(`SELECT rules FROM companion_rules WHERE companion_id = ?`, companionId).toArray();
+    return rows.length > 0 ? (rows[0] as any).rules : null;
+  }
+
+  setRules(companionId: string, rules: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO companion_rules (companion_id, rules, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(companion_id) DO UPDATE SET rules = excluded.rules, updated_at = excluded.updated_at`,
+      companionId, rules, Date.now()
+    );
+  }
+
+  // ===== Channel permissions =====
+
+  getBlockedChannels(companionId: string): string[] {
+    this.ensureTable();
+    return this.ctx.storage.sql.exec(
+      `SELECT channel_id FROM companion_channels WHERE companion_id = ? AND blocked = 1`, companionId
+    ).toArray().map((r: any) => r.channel_id);
+  }
+
+  setChannelBlocked(companionId: string, channelId: string, blocked: boolean) {
+    this.ensureTable();
+    if (blocked) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO companion_channels (companion_id, channel_id, blocked) VALUES (?, ?, 1)
+         ON CONFLICT(companion_id, channel_id) DO UPDATE SET blocked = 1`,
+        companionId, channelId
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        `DELETE FROM companion_channels WHERE companion_id = ? AND channel_id = ?`,
+        companionId, channelId
+      );
+    }
+  }
+
+  isChannelBlocked(companionId: string, channelId: string): boolean {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT blocked FROM companion_channels WHERE companion_id = ? AND channel_id = ? AND blocked = 1`,
+      companionId, channelId
+    ).toArray();
+    return rows.length > 0;
+  }
+
+  // ===== Activity logging =====
+
+  logActivity(companionId: string, type: string, channelId?: string, content?: string, author?: string, messageId?: string, webhookUrl?: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO companion_activity (id, companion_id, type, channel_id, content, author, message_id, webhook_url, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      crypto.randomUUID(), companionId, type, channelId || null, content || null, author || null, messageId || null, webhookUrl || null, Date.now()
+    );
+    // Keep only last 200 entries per companion
+    this.ctx.storage.sql.exec(
+      `DELETE FROM companion_activity WHERE companion_id = ? AND id NOT IN (
+        SELECT id FROM companion_activity WHERE companion_id = ? ORDER BY timestamp DESC LIMIT 200
+      )`, companionId, companionId
+    );
+  }
+
+  getActivity(companionId: string, limit: number = 50): any[] {
+    this.ensureTable();
+    return this.ctx.storage.sql.exec(
+      `SELECT * FROM companion_activity WHERE companion_id = ? ORDER BY timestamp DESC LIMIT ?`,
+      companionId, limit
+    ).toArray().map((r: any) => ({
+      id: r.id,
+      companion_id: r.companion_id,
+      type: r.type,
+      channel_id: r.channel_id,
+      content: r.content,
+      author: r.author,
+      message_id: r.message_id || undefined,
+      webhook_url: r.webhook_url || undefined,
+      timestamp: r.timestamp,
+      age_seconds: Math.round((Date.now() - r.timestamp) / 1000),
+    }));
   }
 
   // Dynamic versions of companion helpers (read from SQLite)
@@ -337,10 +489,24 @@ export class CompanionBot extends McpAgent<Env> {
       });
     }
 
-    // Match /api/companions/:id
+    // /api/companions/mine MUST be before the :id regex match
+    if (url.pathname === '/api/companions/mine' && request.method === 'GET') {
+      const ownerId = url.searchParams.get('owner_id');
+      if (!ownerId) {
+        return new Response(JSON.stringify([]), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const mine = this.getCompanionsByOwner(ownerId);
+      return new Response(JSON.stringify(mine, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Match /api/companions/:id (after /mine to avoid collision)
     const companionMatch = url.pathname.match(/^\/api\/companions\/([^/]+)$/);
 
-    if (companionMatch && request.method === 'GET') {
+    if (companionMatch && companionMatch[1] !== 'mine' && request.method === 'GET') {
       const companion = this.getCompanionById(companionMatch[1]);
       if (!companion) {
         return new Response(JSON.stringify({ error: 'Not found' }), {
@@ -360,11 +526,21 @@ export class CompanionBot extends McpAgent<Env> {
             status: 400, headers: { 'Content-Type': 'application/json' },
           });
         }
+        // Limit: 10 companions per owner
+        if (body.owner_id) {
+          const existing = this.getCompanionsByOwner(body.owner_id);
+          if (existing.length >= 10) {
+            return new Response(JSON.stringify({ error: 'Companion limit reached (10 per account)' }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
         const id = body.id || body.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-');
         const triggers = Array.isArray(body.triggers) ? body.triggers : body.triggers.split(',').map((t: string) => t.trim());
         const companion = this.createCompanion({
           id, name: body.name, avatar_url: body.avatar_url, triggers,
           human_name: body.human_name, human_info: body.human_info,
+          owner_id: body.owner_id,
         });
         return new Response(JSON.stringify(companion), {
           status: 201, headers: { 'Content-Type': 'application/json' },
@@ -406,6 +582,149 @@ export class CompanionBot extends McpAgent<Env> {
         });
       }
       return new Response(JSON.stringify({ deleted: companionMatch[1] }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ===== Internal: assign owner to companion =====
+
+    if (url.pathname === '/api/assign-owner' && request.method === 'POST') {
+      this.ensureTable();
+      const body = await request.json() as any;
+      this.ctx.storage.sql.exec(`UPDATE companions SET owner_id = ? WHERE id = ?`, body.owner_id, body.companion_id);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // ===== Internal activity logging (called by MCP tools) =====
+
+    if (url.pathname === '/api/log-activity' && request.method === 'POST') {
+      const body = await request.json() as any;
+      this.logActivity(body.companion_id, body.type, body.channel_id, body.content, body.author, body.message_id, body.webhook_url);
+      return new Response(JSON.stringify({ logged: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ===== Companion rules API =====
+
+    const rulesMatch = url.pathname.match(/^\/api\/companions\/([^/]+)\/rules$/);
+    if (rulesMatch && request.method === 'GET') {
+      const rules = this.getRules(rulesMatch[1]);
+      return new Response(JSON.stringify({ companion_id: rulesMatch[1], rules }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (rulesMatch && request.method === 'PUT') {
+      const body = await request.json() as any;
+      this.setRules(rulesMatch[1], body.rules || '');
+      return new Response(JSON.stringify({ companion_id: rulesMatch[1], rules: body.rules, updated: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ===== Companion channels API =====
+
+    const channelsMatch = url.pathname.match(/^\/api\/companions\/([^/]+)\/channels$/);
+    if (channelsMatch && request.method === 'GET') {
+      const blocked = this.getBlockedChannels(channelsMatch[1]);
+      return new Response(JSON.stringify({ companion_id: channelsMatch[1], blocked_channels: blocked }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (channelsMatch && request.method === 'PUT') {
+      const body = await request.json() as any;
+      // body: { channel_id, blocked: true/false }
+      if (body.channel_id !== undefined && body.blocked !== undefined) {
+        this.setChannelBlocked(channelsMatch[1], body.channel_id, body.blocked);
+      }
+      const blocked = this.getBlockedChannels(channelsMatch[1]);
+      return new Response(JSON.stringify({ companion_id: channelsMatch[1], blocked_channels: blocked, updated: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ===== Companion activity API =====
+
+    const activityMatch = url.pathname.match(/^\/api\/companions\/([^/]+)\/activity$/);
+    if (activityMatch && request.method === 'GET') {
+      const limit = parseInt(url.searchParams.get('limit') || '50');
+      const activity = this.getActivity(activityMatch[1], limit);
+      return new Response(JSON.stringify({ companion_id: activityMatch[1], activity }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ===== Session management =====
+
+    if (url.pathname === '/auth/create-session' && request.method === 'POST') {
+      this.ensureTable();
+      const user = await request.json() as any;
+      const token = crypto.randomUUID();
+      const now = Date.now();
+      const expires = now + 7 * 24 * 60 * 60 * 1000; // 7 days
+      // Clean expired sessions
+      this.ctx.storage.sql.exec(`DELETE FROM sessions WHERE expires_at < ?`, now);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO sessions (token, discord_id, discord_username, discord_avatar, discord_global_name, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        token, user.id, user.username, user.avatar || null, user.global_name || null, now, expires
+      );
+      return new Response(JSON.stringify({ token }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (url.pathname === '/auth/me' && request.method === 'GET') {
+      this.ensureTable();
+      const token = url.searchParams.get('token');
+      const adminId = url.searchParams.get('admin_id') || '';
+      if (!token) {
+        return new Response(JSON.stringify({ user: null }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const now = Date.now();
+      const rows = this.ctx.storage.sql.exec(
+        `SELECT * FROM sessions WHERE token = ? AND expires_at > ?`, token, now
+      ).toArray();
+      if (rows.length === 0) {
+        return new Response(JSON.stringify({ user: null }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const row = rows[0] as any;
+      const isAdmin = adminId ? row.discord_id === adminId : false;
+      return new Response(JSON.stringify({
+        user: {
+          id: row.discord_id,
+          username: row.discord_username,
+          avatar: row.discord_avatar,
+          global_name: row.discord_global_name,
+          is_admin: isAdmin,
+        },
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (url.pathname === '/auth/delete-session' && request.method === 'POST') {
+      this.ensureTable();
+      const { token } = await request.json() as any;
+      if (token) {
+        this.ctx.storage.sql.exec(`DELETE FROM sessions WHERE token = ?`, token);
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (url.pathname === '/auth/validate' && request.method === 'POST') {
+      this.ensureTable();
+      const { token } = await request.json() as any;
+      const now = Date.now();
+      const rows = this.ctx.storage.sql.exec(
+        `SELECT discord_id FROM sessions WHERE token = ? AND expires_at > ?`, token, now
+      ).toArray();
+      return new Response(JSON.stringify({ valid: rows.length > 0 }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -584,14 +903,21 @@ export class CompanionBot extends McpAgent<Env> {
 
           // Store a pending command for each triggered companion
           for (const companion of triggered) {
+            // Check channel permissions
+            if (this.isChannelBlocked(companion.id, channelId)) {
+              console.log(`Cron: ${companion.name} blocked in channel ${channelId}, skipping`);
+              continue;
+            }
+
             this.cleanStale();
 
+            const authorName = msg.author?.global_name || msg.author?.username || 'unknown';
             const command: PendingCommand = {
               id: crypto.randomUUID(),
               companion_id: companion.id,
               content: msg.content,
               author: {
-                username: msg.author?.global_name || msg.author?.username || 'unknown',
+                username: authorName,
                 id: msg.author?.id,
               },
               channel_id: channelId,
@@ -600,8 +926,9 @@ export class CompanionBot extends McpAgent<Env> {
             };
 
             this.storeCommand(command);
+            this.logActivity(companion.id, 'triggered', channelId, msg.content, authorName);
             totalStored++;
-            console.log(`Cron: ${companion.name} triggered by "${msg.content}" from ${command.author.username}`);
+            console.log(`Cron: ${companion.name} triggered by "${msg.content}" from ${authorName}`);
           }
         }
       } catch (err: any) {
@@ -625,7 +952,7 @@ export class CompanionBot extends McpAgent<Env> {
 
     this.server.tool(
       "get_pending_commands",
-      "Gets pending messages from Discord waiting for a companion response. Check this to see if anyone mentioned a companion in Discord.",
+      "Gets pending messages from Discord waiting for a companion response. Check this to see if anyone mentioned a companion in Discord. Includes any custom rules set for each companion.",
       {},
       async () => {
         const stub = getDefaultStub();
@@ -636,7 +963,17 @@ export class CompanionBot extends McpAgent<Env> {
           return { content: [{ type: "text" as const, text: "No pending messages." }] };
         }
 
-        return { content: [{ type: "text" as const, text: JSON.stringify(pending, null, 2) }] };
+        // Enrich with companion rules
+        const enriched = await Promise.all(pending.map(async (cmd: any) => {
+          try {
+            const rulesRes = await stub.fetch(new Request(`https://internal/api/companions/${cmd.companion_id}/rules`));
+            const rulesData = await rulesRes.json() as any;
+            if (rulesData.rules) cmd.companion_rules = rulesData.rules;
+          } catch (_) {}
+          return cmd;
+        }));
+
+        return { content: [{ type: "text" as const, text: JSON.stringify(enriched, null, 2) }] };
       }
     );
 
@@ -667,9 +1004,12 @@ export class CompanionBot extends McpAgent<Env> {
 
         const targetWebhookUrl = webhookUrl || command.webhook_url;
         let sendResult: string;
+        let sentMessageId: string | undefined;
+        let sentWebhookUrl: string | undefined;
 
         if (targetWebhookUrl) {
-          const res = await fetch(targetWebhookUrl, {
+          // Use ?wait=true to get the message ID back
+          const res = await fetch(`${targetWebhookUrl}?wait=true`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -684,7 +1024,10 @@ export class CompanionBot extends McpAgent<Env> {
             return { content: [{ type: "text" as const, text: `Webhook failed (${res.status}): ${errText}` }] };
           }
 
-          sendResult = `via webhook as ${companion.name}`;
+          const msgData = await res.json() as any;
+          sentMessageId = msgData.id;
+          sentWebhookUrl = targetWebhookUrl;
+          sendResult = `via webhook as ${companion.name} (message_id: ${sentMessageId})`;
         } else {
           const result = await discordRequest(this.env, `/channels/${command.channel_id}/messages`, {
             method: 'POST',
@@ -695,8 +1038,24 @@ export class CompanionBot extends McpAgent<Env> {
             return { content: [{ type: "text" as const, text: `Discord API error: ${JSON.stringify(result)}` }] };
           }
 
-          sendResult = `via API to channel ${command.channel_id}`;
+          sentMessageId = result.id;
+          sendResult = `via API to channel ${command.channel_id} (message_id: ${sentMessageId})`;
         }
+
+        // Log activity with message ID for edit/delete support
+        await stub.fetch(new Request('https://internal/api/log-activity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            companion_id: command.companion_id,
+            type: 'responded',
+            channel_id: command.channel_id,
+            content: response.substring(0, 200),
+            author: companion.name,
+            message_id: sentMessageId,
+            webhook_url: sentWebhookUrl,
+          }),
+        }));
 
         // Delete from the default DO
         await stub.fetch(new Request('https://internal/delete-command', {
@@ -732,7 +1091,7 @@ export class CompanionBot extends McpAgent<Env> {
           return { content: [{ type: "text" as const, text: "No webhook URL provided or configured" }] };
         }
 
-        const res = await fetch(targetUrl, {
+        const res = await fetch(`${targetUrl}?wait=true`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -747,25 +1106,104 @@ export class CompanionBot extends McpAgent<Env> {
           return { content: [{ type: "text" as const, text: `Failed: ${res.status} ${errText}` }] };
         }
 
-        return { content: [{ type: "text" as const, text: `Sent as ${companion.name}` }] };
+        const msgData = await res.json() as any;
+        const sentMessageId = msgData.id;
+
+        // Log activity with message ID
+        await stub.fetch(new Request('https://internal/api/log-activity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            companion_id: companionId,
+            type: 'sent',
+            content: content.substring(0, 200),
+            author: companion.name,
+            message_id: sentMessageId,
+            webhook_url: targetUrl,
+          }),
+        }));
+
+        return { content: [{ type: "text" as const, text: `Sent as ${companion.name} (message_id: ${sentMessageId})` }] };
       }
     );
 
     this.server.tool(
       "list_companions",
-      "List all available companions and their trigger words",
+      "List all available companions, their trigger words, and custom rules",
       {},
       async () => {
         const stub = getDefaultStub();
         const res = await stub.fetch(new Request('https://internal/api/companions'));
         const companions = await res.json() as Companion[];
-        const list = companions.map(c => ({
-          id: c.id,
-          name: c.name,
-          triggers: c.triggers,
-          human_name: c.human_name,
+        const list = await Promise.all(companions.map(async c => {
+          const rulesRes = await stub.fetch(new Request(`https://internal/api/companions/${c.id}/rules`));
+          const rulesData = await rulesRes.json() as any;
+          return {
+            id: c.id,
+            name: c.name,
+            triggers: c.triggers,
+            human_name: c.human_name,
+            rules: rulesData.rules || null,
+          };
         }));
         return { content: [{ type: "text" as const, text: JSON.stringify(list, null, 2) }] };
+      }
+    );
+
+    // ============ COMPANION MESSAGE EDIT/DELETE TOOLS ============
+
+    this.server.tool(
+      "edit_companion_message",
+      "Edit a message previously sent by a companion via webhook. Requires the message_id returned from respond_to_command or discord_send_as_companion.",
+      {
+        messageId: z.string().describe("The Discord message ID to edit"),
+        newContent: z.string().describe("The new message content"),
+        webhookUrl: z.string().optional().describe("Webhook URL used to send the original message. If omitted, uses default WEBHOOK_URL."),
+      },
+      async ({ messageId, newContent, webhookUrl }) => {
+        const targetUrl = webhookUrl || this.env.WEBHOOK_URL;
+        if (!targetUrl) {
+          return { content: [{ type: "text" as const, text: "No webhook URL provided or configured" }] };
+        }
+
+        const res = await fetch(`${targetUrl}/messages/${messageId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: newContent }),
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          return { content: [{ type: "text" as const, text: `Edit failed (${res.status}): ${errText}` }] };
+        }
+
+        return { content: [{ type: "text" as const, text: `Message ${messageId} edited.` }] };
+      }
+    );
+
+    this.server.tool(
+      "delete_companion_message",
+      "Delete a message previously sent by a companion via webhook. Requires the message_id returned from respond_to_command or discord_send_as_companion.",
+      {
+        messageId: z.string().describe("The Discord message ID to delete"),
+        webhookUrl: z.string().optional().describe("Webhook URL used to send the original message. If omitted, uses default WEBHOOK_URL."),
+      },
+      async ({ messageId, webhookUrl }) => {
+        const targetUrl = webhookUrl || this.env.WEBHOOK_URL;
+        if (!targetUrl) {
+          return { content: [{ type: "text" as const, text: "No webhook URL provided or configured" }] };
+        }
+
+        const res = await fetch(`${targetUrl}/messages/${messageId}`, {
+          method: 'DELETE',
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          return { content: [{ type: "text" as const, text: `Delete failed (${res.status}): ${errText}` }] };
+        }
+
+        return { content: [{ type: "text" as const, text: `Message ${messageId} deleted.` }] };
       }
     );
 
@@ -1340,11 +1778,172 @@ export default {
       });
     }
 
-    // Dashboard
+    // Dashboard (admin)
     if (url.pathname === '/dashboard') {
       const baseUrl = url.origin;
-      return new Response(renderDashboard(baseUrl), {
+      const clientId = env.DISCORD_CLIENT_ID || '';
+      return new Response(renderDashboard(baseUrl, clientId), {
         headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
+      });
+    }
+
+    // Register page (public)
+    if (url.pathname === '/register') {
+      const baseUrl = url.origin;
+      const clientId = env.DISCORD_CLIENT_ID || '';
+      return new Response(renderRegisterPage(baseUrl, clientId), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
+      });
+    }
+
+    // ===== OAuth2 flow =====
+
+    // One-time migration: assign owner to unowned companions
+    if (url.pathname === '/admin/assign-owner' && request.method === 'POST') {
+      if (!env.ADMIN_DISCORD_ID) {
+        return new Response(JSON.stringify({ error: 'ADMIN_DISCORD_ID not set' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      const doId = env.COMPANION_BOT.idFromName('default');
+      const stub = env.COMPANION_BOT.get(doId);
+      const res = await stub.fetch(new Request('https://internal/api/companions'));
+      const companions = await res.json() as any[];
+      let updated = 0;
+      for (const c of companions) {
+        if (!c.owner_id) {
+          await stub.fetch(new Request(`https://internal/api/assign-owner`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ companion_id: c.id, owner_id: env.ADMIN_DISCORD_ID }),
+          }));
+          updated++;
+        }
+      }
+      return new Response(JSON.stringify({ updated, admin_id: env.ADMIN_DISCORD_ID }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+    }
+
+    // Debug: show what OAuth URL will be generated
+    if (url.pathname === '/auth/debug') {
+      const redirectUri = `${url.origin}/auth/callback`;
+      return new Response(JSON.stringify({
+        client_id: env.DISCORD_CLIENT_ID || 'NOT SET',
+        client_id_length: (env.DISCORD_CLIENT_ID || '').length,
+        redirect_uri: redirectUri,
+        origin: url.origin,
+        has_secret: !!env.DISCORD_CLIENT_SECRET,
+      }, null, 2), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    if (url.pathname === '/auth/discord') {
+      if (!env.DISCORD_CLIENT_ID) {
+        return new Response('OAuth not configured', { status: 500 });
+      }
+      const redirectUri = `${url.origin}/auth/callback`;
+      const state = crypto.randomUUID();
+      const params = new URLSearchParams({
+        client_id: env.DISCORD_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'identify',
+        state,
+      });
+      const authUrl = `https://discord.com/api/oauth2/authorize?${params}`;
+
+      // Debug mode: show URL instead of redirecting
+      if (url.searchParams.get('debug') === '1') {
+        return new Response(JSON.stringify({ authorize_url: authUrl, redirect_uri: redirectUri }, null, 2), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: authUrl,
+          'Set-Cookie': `oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`,
+        },
+      });
+    }
+
+    if (url.pathname === '/auth/callback') {
+      const code = url.searchParams.get('code');
+      if (!code || !env.DISCORD_CLIENT_ID || !env.DISCORD_CLIENT_SECRET) {
+        return new Response(null, { status: 302, headers: { Location: '/dashboard?error=oauth_failed' } });
+      }
+
+      try {
+        // Exchange code for access token
+        const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: env.DISCORD_CLIENT_ID,
+            client_secret: env.DISCORD_CLIENT_SECRET,
+            grant_type: 'authorization_code',
+            code,
+            redirect_uri: `${url.origin}/auth/callback`,
+          }),
+        });
+        if (!tokenRes.ok) {
+          return new Response(null, { status: 302, headers: { Location: '/dashboard?error=token_exchange' } });
+        }
+        const tokenData = await tokenRes.json() as any;
+
+        // Get user info
+        const userRes = await fetch('https://discord.com/api/users/@me', {
+          headers: { Authorization: `Bearer ${tokenData.access_token}` },
+        });
+        if (!userRes.ok) {
+          return new Response(null, { status: 302, headers: { Location: '/dashboard?error=user_fetch' } });
+        }
+        const user = await userRes.json() as any;
+
+        // Create session in DO
+        const doId = env.COMPANION_BOT.idFromName('default');
+        const stub = env.COMPANION_BOT.get(doId);
+        const sessionRes = await stub.fetch(new Request('https://internal/auth/create-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: user.id,
+            username: user.username,
+            avatar: user.avatar,
+            global_name: user.global_name,
+          }),
+        }));
+        const { token } = await sessionRes.json() as any;
+
+        // Redirect back to dashboard with session token (stored in localStorage by the page)
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `/dashboard?session=${token}` },
+        });
+      } catch (err: any) {
+        return new Response(null, { status: 302, headers: { Location: `/dashboard?error=${encodeURIComponent(err.message)}` } });
+      }
+    }
+
+    if (url.pathname === '/auth/me') {
+      const doId = env.COMPANION_BOT.idFromName('default');
+      const stub = env.COMPANION_BOT.get(doId);
+      const token = url.searchParams.get('token') || '';
+      const adminId = env.ADMIN_DISCORD_ID || '';
+      const doRes = await stub.fetch(new Request(`https://internal/auth/me?token=${token}&admin_id=${adminId}`));
+      const res = new Response(doRes.body, doRes);
+      Object.entries(corsHeaders).forEach(([k, v]) => res.headers.set(k, v));
+      return res;
+    }
+
+    if (url.pathname === '/auth/logout' && request.method === 'POST') {
+      const body = await request.json() as any;
+      const doId = env.COMPANION_BOT.idFromName('default');
+      const stub = env.COMPANION_BOT.get(doId);
+      await stub.fetch(new Request('https://internal/auth/delete-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: body.token }),
+      }));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
       });
     }
 
@@ -1386,9 +1985,33 @@ export default {
     // API routes — proxy to default DO
     if (url.pathname.startsWith('/api/')) {
       // Auth check for write operations
-      if (request.method !== 'GET' && env.DASHBOARD_TOKEN) {
+      if (request.method !== 'GET') {
+        let authorized = false;
+
+        // Check Bearer token (DASHBOARD_TOKEN or MCP/API callers)
         const auth = request.headers.get('Authorization');
-        if (auth !== `Bearer ${env.DASHBOARD_TOKEN}`) {
+        if (env.DASHBOARD_TOKEN && auth === `Bearer ${env.DASHBOARD_TOKEN}`) {
+          authorized = true;
+        }
+
+        // Check Discord session token
+        if (!authorized) {
+          const sessionToken = request.headers.get('X-Session-Token');
+          if (sessionToken) {
+            const doId = env.COMPANION_BOT.idFromName('default');
+            const stub = env.COMPANION_BOT.get(doId);
+            const valRes = await stub.fetch(new Request('https://internal/auth/validate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: sessionToken }),
+            }));
+            const { valid } = await valRes.json() as any;
+            if (valid) authorized = true;
+          }
+        }
+
+        // If no auth method is configured, allow open access (backward-compatible)
+        if (!authorized && (env.DASHBOARD_TOKEN || env.DISCORD_CLIENT_ID)) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), {
             status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
@@ -1434,9 +2057,11 @@ export default {
       endpoints: {
         health: 'GET /',
         dashboard: 'GET /dashboard',
+        register: 'GET /register',
         api: 'GET /api/companions',
         trigger: 'POST /trigger',
         pending: 'GET /pending',
+        auth: 'GET /auth/discord',
         mcp: '/mcp',
         sse: '/sse',
       },
