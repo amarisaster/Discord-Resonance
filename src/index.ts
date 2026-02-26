@@ -144,6 +144,12 @@ export class CompanionBot extends McpAgent<Env> {
       webhook_url TEXT NOT NULL,
       created_at INTEGER NOT NULL
     )`);
+    // Banned servers — bot auto-leaves if re-invited
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS banned_servers (
+      guild_id TEXT PRIMARY KEY,
+      reason TEXT,
+      banned_at INTEGER NOT NULL
+    )`);
     // Migration: add owner_id to companions (idempotent)
     try {
       this.ctx.storage.sql.exec(`ALTER TABLE companions ADD COLUMN owner_id TEXT`);
@@ -228,7 +234,7 @@ export class CompanionBot extends McpAgent<Env> {
     return { ...data };
   }
 
-  updateCompanion(id: string, data: { name?: string; avatar_url?: string; triggers?: string[]; human_name?: string; human_info?: string }): Companion | undefined {
+  updateCompanion(id: string, data: { name?: string; avatar_url?: string; triggers?: string[]; human_name?: string; human_info?: string; owner_id?: string }): Companion | undefined {
     this.ensureTable();
     const existing = this.getCompanionById(id);
     if (!existing) return undefined;
@@ -239,11 +245,12 @@ export class CompanionBot extends McpAgent<Env> {
       triggers: data.triggers ?? existing.triggers,
       human_name: data.human_name ?? existing.human_name,
       human_info: data.human_info ?? existing.human_info,
+      owner_id: data.owner_id ?? (existing as any).owner_id,
     };
 
     this.ctx.storage.sql.exec(
-      `UPDATE companions SET name = ?, avatar_url = ?, triggers = ?, human_name = ?, human_info = ?, updated_at = ? WHERE id = ?`,
-      updated.name, updated.avatar_url, JSON.stringify(updated.triggers), updated.human_name || null, updated.human_info || null, Date.now(), id
+      `UPDATE companions SET name = ?, avatar_url = ?, triggers = ?, human_name = ?, human_info = ?, owner_id = ?, updated_at = ? WHERE id = ?`,
+      updated.name, updated.avatar_url, JSON.stringify(updated.triggers), updated.human_name || null, updated.human_info || null, updated.owner_id || null, Date.now(), id
     );
 
     return { id, ...updated };
@@ -401,6 +408,37 @@ export class CompanionBot extends McpAgent<Env> {
 
     // Fallback to global WEBHOOK_URL
     return this.env.WEBHOOK_URL || null;
+  }
+
+  // Get or create webhook via the default DO (for use from MCP session DOs)
+  async getOrCreateWebhookViaDefault(channelId: string): Promise<string | null> {
+    const defaultStub = this.getDefaultStub();
+    const resp = await defaultStub.fetch(new Request(`http://internal/api/channel-webhook/${channelId}`));
+    const data = await resp.json() as any;
+    return data.webhook_url || null;
+  }
+
+  // Send a DM notification to a companion's owner when triggered
+  async notifyOwnerDM(companion: Companion & { owner_id?: string }, channelId: string, content: string, authorName: string): Promise<void> {
+    if (!companion.owner_id) return;
+    try {
+      // Create DM channel
+      const dm = await discordRequest(this.env, `/users/@me/channels`, {
+        method: 'POST', body: JSON.stringify({ recipient_id: companion.owner_id })
+      });
+      if (dm.error || !dm.id) return;
+
+      const preview = content.length > 200 ? content.slice(0, 200) + '...' : content;
+      const jumpLink = `https://discord.com/channels/-/${channelId}`;
+      await discordRequest(this.env, `/channels/${dm.id}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          content: `🔔 **${companion.name}** was triggered by **${authorName}**:\n> ${preview}\n[Jump to message](${jumpLink})`
+        })
+      });
+    } catch (_) {
+      // DM notification is best-effort, don't break polling on failure
+    }
   }
 
   // Dynamic versions of companion helpers (read from SQLite)
@@ -796,6 +834,54 @@ export class CompanionBot extends McpAgent<Env> {
       });
     }
 
+    // ===== Server ban API =====
+
+    if (url.pathname === '/api/ban-server' && request.method === 'POST') {
+      const body = await request.json() as any;
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO banned_servers (guild_id, reason, banned_at) VALUES (?, ?, ?)`,
+        body.guild_id, body.reason || null, Date.now()
+      );
+      // Try to leave the server
+      try {
+        await discordRequest(this.env, `/users/@me/guilds/${body.guild_id}`, { method: 'DELETE' });
+      } catch (_) {}
+      return new Response(JSON.stringify({ ok: true, guild_id: body.guild_id }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (url.pathname === '/api/unban-server' && request.method === 'POST') {
+      const body = await request.json() as any;
+      this.ctx.storage.sql.exec(`DELETE FROM banned_servers WHERE guild_id = ?`, body.guild_id);
+      return new Response(JSON.stringify({ ok: true, guild_id: body.guild_id }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (url.pathname === '/api/banned-servers' && request.method === 'GET') {
+      const rows = this.ctx.storage.sql.exec(`SELECT * FROM banned_servers ORDER BY banned_at DESC`).toArray();
+      return new Response(JSON.stringify(rows), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Check if a server is banned (used by main worker on guild join)
+    if (url.pathname === '/api/check-ban' && request.method === 'GET') {
+      const guildId = url.searchParams.get('guild_id');
+      if (!guildId) {
+        return new Response(JSON.stringify({ banned: false }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const rows = this.ctx.storage.sql.exec(
+        `SELECT * FROM banned_servers WHERE guild_id = ?`, guildId
+      ).toArray();
+      return new Response(JSON.stringify({ banned: rows.length > 0, reason: rows[0]?.reason || null }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
     // Status endpoint — includes server/channel info
     if (url.pathname === '/api/status' && request.method === 'GET') {
       const pending = this.getPending();
@@ -996,6 +1082,10 @@ export class CompanionBot extends McpAgent<Env> {
 
             this.storeCommand(command);
             this.logActivity(companion.id, 'triggered', channelId, msg.content, authorName);
+
+            // DM notification to companion owner (best-effort, non-blocking)
+            this.notifyOwnerDM(companion, channelId, msg.content, authorName).catch(() => {});
+
             totalStored++;
             console.log(`Cron: ${companion.name} triggered by "${msg.content}" from ${authorName}`);
           }
@@ -1815,6 +1905,398 @@ export class CompanionBot extends McpAgent<Env> {
           return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         return { content: [{ type: "text", text: `Message sent to thread ${threadId}` }] };
+      }
+    );
+
+    // ===== New tools merged from Arachne Discord MCP =====
+
+    this.server.tool(
+      "discord_send_dm",
+      "Send a direct message to a Discord user. Note: the DM comes from the bot, not a companion webhook persona.",
+      {
+        userId: z.string().describe("The Discord user ID to DM"),
+        message: z.string().describe("The message content")
+      },
+      async ({ userId, message }) => {
+        // Create DM channel first
+        const dm = await discordRequest(this.env, `/users/@me/channels`, {
+          method: 'POST', body: JSON.stringify({ recipient_id: userId })
+        });
+        if (dm.error) {
+          return { content: [{ type: "text", text: `Failed to open DM: ${JSON.stringify(dm)}` }] };
+        }
+        const result = await discordRequest(this.env, `/channels/${dm.id}/messages`, {
+          method: 'POST', body: JSON.stringify({ content: message })
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to send DM: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `DM sent to user ${userId}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_create_poll",
+      "Create a poll in a Discord channel. Note: polls are sent as the bot, not a companion.",
+      {
+        channelId: z.string().describe("The channel ID"),
+        question: z.string().describe("The poll question"),
+        answers: z.array(z.string()).min(2).max(10).describe("Poll answer options (2-10)"),
+        durationHours: z.number().min(1).max(768).optional().describe("Poll duration in hours (default 24)"),
+        allowMultiselect: z.boolean().optional().describe("Allow multiple selections (default false)")
+      },
+      async ({ channelId, question, answers, durationHours, allowMultiselect }) => {
+        const result = await discordRequest(this.env, `/channels/${channelId}/messages`, {
+          method: 'POST',
+          body: JSON.stringify({
+            poll: {
+              question: { text: question },
+              answers: answers.map(a => ({ poll_media: { text: a } })),
+              duration: durationHours || 24,
+              allow_multiselect: allowMultiselect || false,
+            }
+          })
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to create poll: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Poll created in channel ${channelId}: "${question}" with ${answers.length} options` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_edit_message",
+      "Edit a message sent by the bot in a channel",
+      {
+        channelId: z.string().describe("The channel ID"),
+        messageId: z.string().describe("The message ID to edit"),
+        newContent: z.string().describe("The new message content")
+      },
+      async ({ channelId, messageId, newContent }) => {
+        const result = await discordRequest(this.env, `/channels/${channelId}/messages/${messageId}`, {
+          method: 'PATCH', body: JSON.stringify({ content: newContent })
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to edit message: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Message ${messageId} edited` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_pin_message",
+      "Pin a message in a channel",
+      {
+        channelId: z.string().describe("The channel ID"),
+        messageId: z.string().describe("The message ID to pin")
+      },
+      async ({ channelId, messageId }) => {
+        const result = await discordRequest(this.env, `/channels/${channelId}/pins/${messageId}`, {
+          method: 'PUT'
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to pin message: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Message ${messageId} pinned in channel ${channelId}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_unpin_message",
+      "Unpin a message in a channel",
+      {
+        channelId: z.string().describe("The channel ID"),
+        messageId: z.string().describe("The message ID to unpin")
+      },
+      async ({ channelId, messageId }) => {
+        const result = await discordRequest(this.env, `/channels/${channelId}/pins/${messageId}`, {
+          method: 'DELETE'
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to unpin message: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Message ${messageId} unpinned` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_timeout_user",
+      "Timeout (mute) a user in a server for a specified duration",
+      {
+        guildId: z.string().describe("The server/guild ID"),
+        userId: z.string().describe("The user ID to timeout"),
+        durationMinutes: z.number().min(1).max(40320).describe("Timeout duration in minutes (max 28 days)"),
+        reason: z.string().optional().describe("Reason for timeout")
+      },
+      async ({ guildId, userId, durationMinutes, reason }) => {
+        const until = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+        const headers: Record<string, string> = {};
+        if (reason) headers['X-Audit-Log-Reason'] = reason;
+        const result = await discordRequest(this.env, `/guilds/${guildId}/members/${userId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ communication_disabled_until: until }),
+          headers
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to timeout user: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `User ${userId} timed out for ${durationMinutes} minutes${reason ? ` (reason: ${reason})` : ''}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_remove_timeout",
+      "Remove a timeout from a user in a server",
+      {
+        guildId: z.string().describe("The server/guild ID"),
+        userId: z.string().describe("The user ID to remove timeout from")
+      },
+      async ({ guildId, userId }) => {
+        const result = await discordRequest(this.env, `/guilds/${guildId}/members/${userId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ communication_disabled_until: null })
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to remove timeout: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Timeout removed for user ${userId}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_assign_role",
+      "Assign a role to a user in a server",
+      {
+        guildId: z.string().describe("The server/guild ID"),
+        userId: z.string().describe("The user ID"),
+        roleId: z.string().describe("The role ID to assign")
+      },
+      async ({ guildId, userId, roleId }) => {
+        const result = await discordRequest(this.env, `/guilds/${guildId}/members/${userId}/roles/${roleId}`, {
+          method: 'PUT'
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to assign role: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Role ${roleId} assigned to user ${userId}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_remove_role",
+      "Remove a role from a user in a server",
+      {
+        guildId: z.string().describe("The server/guild ID"),
+        userId: z.string().describe("The user ID"),
+        roleId: z.string().describe("The role ID to remove")
+      },
+      async ({ guildId, userId, roleId }) => {
+        const result = await discordRequest(this.env, `/guilds/${guildId}/members/${userId}/roles/${roleId}`, {
+          method: 'DELETE'
+        });
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to remove role: ${JSON.stringify(result)}` }] };
+        }
+        return { content: [{ type: "text", text: `Role ${roleId} removed from user ${userId}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_list_members",
+      "List members of a Discord server with their roles and join dates",
+      {
+        guildId: z.string().describe("The server/guild ID"),
+        limit: z.number().min(1).max(1000).optional().describe("Max members to return (default 100)")
+      },
+      async ({ guildId, limit }) => {
+        const result = await discordRequest(this.env, `/guilds/${guildId}/members?limit=${limit || 100}`);
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to list members: ${JSON.stringify(result)}` }] };
+        }
+        const members = (result as any[]).map((m: any) => ({
+          id: m.user?.id,
+          username: m.user?.username,
+          display_name: m.nick || m.user?.global_name || m.user?.username,
+          roles: m.roles,
+          joined_at: m.joined_at,
+          bot: m.user?.bot || false,
+        }));
+        return { content: [{ type: "text", text: JSON.stringify(members, null, 2) }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_get_user_info",
+      "Get detailed information about a specific user in a server",
+      {
+        guildId: z.string().describe("The server/guild ID"),
+        userId: z.string().describe("The user ID")
+      },
+      async ({ guildId, userId }) => {
+        const result = await discordRequest(this.env, `/guilds/${guildId}/members/${userId}`);
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to get user info: ${JSON.stringify(result)}` }] };
+        }
+        const m = result as any;
+        const info = {
+          id: m.user?.id,
+          username: m.user?.username,
+          global_name: m.user?.global_name,
+          nickname: m.nick,
+          avatar: m.user?.avatar ? `https://cdn.discordapp.com/avatars/${m.user.id}/${m.user.avatar}.webp` : null,
+          roles: m.roles,
+          joined_at: m.joined_at,
+          premium_since: m.premium_since,
+          bot: m.user?.bot || false,
+          timed_out_until: m.communication_disabled_until,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_list_roles",
+      "List all roles in a Discord server",
+      {
+        guildId: z.string().describe("The server/guild ID")
+      },
+      async ({ guildId }) => {
+        const result = await discordRequest(this.env, `/guilds/${guildId}/roles`);
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to list roles: ${JSON.stringify(result)}` }] };
+        }
+        const roles = (result as any[]).map((r: any) => ({
+          id: r.id,
+          name: r.name,
+          color: r.color ? `#${r.color.toString(16).padStart(6, '0')}` : null,
+          position: r.position,
+          mentionable: r.mentionable,
+          member_count: r.member_count,
+        })).sort((a: any, b: any) => b.position - a.position);
+        return { content: [{ type: "text", text: JSON.stringify(roles, null, 2) }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_get_message",
+      "Get a specific message by ID with full details including attachments",
+      {
+        channelId: z.string().describe("The channel ID"),
+        messageId: z.string().describe("The message ID")
+      },
+      async ({ channelId, messageId }) => {
+        const result = await discordRequest(this.env, `/channels/${channelId}/messages/${messageId}`);
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed to get message: ${JSON.stringify(result)}` }] };
+        }
+        const msg = result as any;
+        const info = {
+          id: msg.id,
+          content: msg.content,
+          author: { id: msg.author?.id, username: msg.author?.username, bot: msg.author?.bot },
+          timestamp: msg.timestamp,
+          edited_timestamp: msg.edited_timestamp,
+          attachments: (msg.attachments || []).map((a: any) => ({
+            id: a.id, filename: a.filename, url: a.url, size: a.size, content_type: a.content_type,
+          })),
+          embeds: msg.embeds?.length || 0,
+          reactions: (msg.reactions || []).map((r: any) => ({
+            emoji: r.emoji?.name, count: r.count,
+          })),
+          pinned: msg.pinned,
+          reply_to: msg.message_reference?.message_id,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_introduce_companion",
+      "Post a rich embed introduction card for a companion in a channel",
+      {
+        companionId: z.string().describe("The companion ID to introduce"),
+        channelId: z.string().describe("The channel ID to post in")
+      },
+      async ({ companionId, channelId }) => {
+        const defaultStub = this.getDefaultStub();
+        const resp = await defaultStub.fetch(new Request('http://internal/api/companions'));
+        const companions = await resp.json() as any[];
+        const companion = companions.find((c: any) => c.id === companionId);
+        if (!companion) {
+          return { content: [{ type: "text", text: `Unknown companion: ${companionId}` }] };
+        }
+
+        const webhookUrl = await this.getOrCreateWebhookViaDefault(channelId);
+        if (!webhookUrl) {
+          return { content: [{ type: "text", text: `Could not get webhook for channel ${channelId}` }] };
+        }
+
+        const embed = {
+          title: companion.name,
+          description: companion.human_info || 'AI Companion',
+          color: 0xE91E8C, // Pink to match the house aesthetic
+          thumbnail: companion.avatar_url ? { url: companion.avatar_url } : undefined,
+          fields: [
+            { name: 'Triggers', value: (companion.triggers || []).map((t: string) => `\`${t}\``).join(', '), inline: true },
+            { name: 'Human', value: companion.human_name || 'Unknown', inline: true },
+          ],
+          footer: { text: 'Discord Resonance — One bot, unlimited companions' },
+        };
+
+        const response = await fetch(`${webhookUrl}?wait=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: companion.name,
+            avatar_url: companion.avatar_url,
+            embeds: [embed],
+          }),
+        });
+
+        if (!response.ok) {
+          return { content: [{ type: "text", text: `Failed to send intro: ${response.status}` }] };
+        }
+        return { content: [{ type: "text", text: `Introduction card posted for ${companion.name} in channel ${channelId}` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_ban_server",
+      "Ban a server from using the bot. The bot will auto-leave if re-invited.",
+      {
+        guildId: z.string().describe("The server/guild ID to ban"),
+        reason: z.string().optional().describe("Reason for the ban")
+      },
+      async ({ guildId, reason }) => {
+        const defaultStub = this.getDefaultStub();
+        const resp = await defaultStub.fetch(new Request('http://internal/api/ban-server', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ guild_id: guildId, reason }),
+        }));
+        const result = await resp.json() as any;
+        if (result.error) {
+          return { content: [{ type: "text", text: `Failed: ${result.error}` }] };
+        }
+        return { content: [{ type: "text", text: `Server ${guildId} banned${reason ? ` (reason: ${reason})` : ''}. Bot will auto-leave if re-invited.` }] };
+      }
+    );
+
+    this.server.tool(
+      "discord_unban_server",
+      "Remove a server ban, allowing the bot to be re-invited.",
+      {
+        guildId: z.string().describe("The server/guild ID to unban")
+      },
+      async ({ guildId }) => {
+        const defaultStub = this.getDefaultStub();
+        const resp = await defaultStub.fetch(new Request('http://internal/api/unban-server', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ guild_id: guildId }),
+        }));
+        const result = await resp.json() as any;
+        return { content: [{ type: "text", text: `Server ${guildId} unbanned.` }] };
       }
     );
   }
