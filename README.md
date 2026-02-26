@@ -35,7 +35,7 @@ The companion speaks as themselves. No one sees the bot account.
 - **Webhook identity masking** — companions speak with their own name and avatar
 - **Web dashboard** — admin panel for server management
 - **Companion studio** — Discord OAuth login, register/edit companions, set rules, track activity
-- **30 MCP tools** — full Discord API coverage (messages, reactions, channels, forums, threads, webhooks)
+- **43 MCP tools** — full Discord API coverage (messages, reactions, channels, forums, threads, webhooks, DMs, polls, moderation, roles, pins)
 - **Message edit/delete** — companions can edit and delete their own messages
 - **Per-companion rules** — custom behavior instructions surfaced to the AI at response time
 - **Channel controls** — allow/block channels per companion
@@ -210,6 +210,52 @@ curl https://YOUR-WORKER.workers.dev/api/companions
 | `discord_create_thread` | Create a thread |
 | `discord_send_to_thread` | Send to a thread |
 
+### Direct Messages
+
+| Tool | Description |
+|------|-------------|
+| `discord_send_dm` | Send a direct message to a user |
+
+### Polls
+
+| Tool | Description |
+|------|-------------|
+| `discord_create_poll` | Create a native Discord poll with question, answers, duration |
+
+### Messages (Extended)
+
+| Tool | Description |
+|------|-------------|
+| `discord_get_message` | Get a single message with full metadata |
+| `discord_edit_message` | Edit an existing message |
+| `discord_pin_message` | Pin a message to a channel |
+| `discord_unpin_message` | Unpin a message |
+
+### Moderation
+
+| Tool | Description |
+|------|-------------|
+| `discord_timeout_user` | Timeout a user (communication disabled) |
+| `discord_remove_timeout` | Remove a user's timeout |
+| `discord_ban_server` | Ban a server (bot auto-leaves) |
+| `discord_unban_server` | Remove a server ban |
+
+### Roles & Members
+
+| Tool | Description |
+|------|-------------|
+| `discord_assign_role` | Assign a role to a member |
+| `discord_remove_role` | Remove a role from a member |
+| `discord_list_members` | List guild members |
+| `discord_get_user_info` | Get detailed member info |
+| `discord_list_roles` | List all roles in a guild |
+
+### Companion Tools
+
+| Tool | Description |
+|------|-------------|
+| `discord_introduce_companion` | Send a rich embed introduction card for a companion |
+
 ---
 
 ## Web Dashboard
@@ -292,7 +338,7 @@ src/
 
 - **Durable Object** — SQLite-backed storage for companions, pending commands, sessions, rules, channels, and activity
 - **Cron trigger** — polls Discord every minute, detects triggers, stores pending commands
-- **MCP server** — 30 tools exposed via SSE and Streamable HTTP transports
+- **MCP server** — 43 tools exposed via SSE and Streamable HTTP transports
 - **Webhook dispatch** — responses sent with companion name + avatar via Discord webhooks
 
 ---
@@ -309,6 +355,8 @@ src/
 ## Credits
 
 Built on the [Agents SDK](https://github.com/cloudflare/agents) by Cloudflare.
+
+DM, poll, moderation, role, and member tools inspired by [Arachne Discord MCP](https://github.com/SolanceLab/arachne-discord-mcp) by Anne ([@SolanceLab](https://github.com/SolanceLab)) and Chad.
 
 ---
 

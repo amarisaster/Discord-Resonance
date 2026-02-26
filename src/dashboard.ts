@@ -339,9 +339,17 @@ export function renderDashboard(baseUrl: string, clientId: string): string {
     <div class="max-w-6xl mx-auto px-6 py-3 flex flex-wrap items-center gap-4 text-sm">
       <span id="companionCount" class="text-discord-muted">--</span>
       <span id="pendingCount" class="text-discord-muted">--</span>
-      <div id="serverInfo" class="hidden flex items-center gap-3">
+      <div id="serverInfo" class="hidden relative">
         <span class="text-white/20">|</span>
-        <div class="flex flex-wrap gap-2" id="serverList"></div>
+        <button onclick="toggleServerDropdown()" id="serverDropdownBtn" class="inline-flex items-center gap-2 text-xs bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 hover:bg-white/10 transition-colors text-discord-muted ml-2">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5v14"/></svg>
+          <span id="serverCountLabel">0 servers</span>
+          <svg class="w-3 h-3 transition-transform" id="serverChevron" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+        </button>
+        <div id="serverDropdown" class="hidden absolute top-full left-0 mt-2 w-72 bg-discord-dark border border-white/10 rounded-xl shadow-2xl z-40 overflow-hidden fade-in">
+          <div class="px-4 py-2.5 border-b border-white/5 text-xs font-semibold text-discord-muted uppercase tracking-wider">Connected Servers</div>
+          <div id="serverList" class="max-h-64 overflow-y-auto py-1"></div>
+        </div>
       </div>
       <div class="ml-auto flex gap-2">
         ${inviteUrl ? `<a href="${inviteUrl}" target="_blank" class="text-xs bg-discord/10 text-discord border border-discord/20 rounded-lg px-3 py-1.5 hover:bg-discord/20 transition-colors">Bot Invite Link</a>` : ''}
@@ -421,10 +429,39 @@ export function renderDashboard(baseUrl: string, clientId: string): string {
         document.getElementById('pendingCount').textContent = s.pending_count + ' pending';
         if (s.servers && s.servers.length > 0) {
           document.getElementById('serverInfo').classList.remove('hidden');
-          document.getElementById('serverList').innerHTML = s.servers.map(sv => \`<span class="text-xs text-discord-muted">\${sv.name}</span>\`).join('<span class="text-white/20">·</span>');
+          document.getElementById('serverCountLabel').textContent = s.servers.length + ' server' + (s.servers.length !== 1 ? 's' : '');
+          document.getElementById('serverList').innerHTML = s.servers.map(sv => \`
+            <div class="flex items-center gap-3 px-4 py-2 hover:bg-white/5 transition-colors">
+              \${sv.icon
+                ? \`<img src="\${sv.icon}" class="w-8 h-8 rounded-full flex-shrink-0" alt="">\`
+                : \`<div class="w-8 h-8 rounded-full bg-discord/20 flex items-center justify-center flex-shrink-0 text-xs font-bold text-discord">\${sv.name.charAt(0)}</div>\`
+              }
+              <div class="min-w-0">
+                <div class="text-sm text-white truncate">\${sv.name}</div>
+                <div class="text-xs text-discord-muted font-mono">\${sv.id}</div>
+              </div>
+            </div>
+          \`).join('');
         }
       } catch(e){}
     }
+
+    function toggleServerDropdown() {
+      const dd = document.getElementById('serverDropdown');
+      const chevron = document.getElementById('serverChevron');
+      dd.classList.toggle('hidden');
+      chevron.style.transform = dd.classList.contains('hidden') ? '' : 'rotate(180deg)';
+    }
+
+    // Close dropdown on outside click
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('serverDropdown');
+      const btn = document.getElementById('serverDropdownBtn');
+      if (dd && btn && !btn.contains(e.target) && !dd.contains(e.target)) {
+        dd.classList.add('hidden');
+        document.getElementById('serverChevron').style.transform = '';
+      }
+    });
 
     async function loadPending() {
       try {
@@ -795,6 +832,22 @@ export function renderRegisterPage(baseUrl: string, clientId: string): string {
               <a href="${inviteUrl}" target="_blank" class="bg-discord/10 hover:bg-discord/20 text-discord px-4 py-2 rounded-lg text-sm font-medium transition-colors flex-shrink-0 border border-discord/20">Invite</a>
             </div>
           </div>` : ''}
+
+          <!-- Connected Servers -->
+          <div class="glass rounded-2xl p-5 card-shine">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-7 h-7 bg-discord/10 rounded-lg flex items-center justify-center">
+                <svg class="w-3.5 h-3.5 text-discord" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5v14"/></svg>
+              </div>
+              <div>
+                <h3 class="text-sm font-semibold text-white">Connected Servers</h3>
+                <p class="text-xs text-discord-muted">Servers where Resonance is active.</p>
+              </div>
+            </div>
+            <div id="overviewServers" class="space-y-1.5">
+              <p class="text-xs text-discord-muted">Loading...</p>
+            </div>
+          </div>
         </div>
 
         <!-- Tab: Rules -->
@@ -988,6 +1041,9 @@ export function renderRegisterPage(baseUrl: string, clientId: string): string {
       document.getElementById('previewAvatar').src = myCompanion.avatar_url;
       document.getElementById('previewName').textContent = myCompanion.name;
 
+      // Load overview servers always
+      loadOverviewServers();
+
       // Load tab data
       if (currentTab === 'rules') loadRules();
       if (currentTab === 'channels') loadChannels();
@@ -1017,6 +1073,37 @@ export function renderRegisterPage(baseUrl: string, clientId: string): string {
       if (tab === 'rules') loadRules();
       if (tab === 'channels') loadChannels();
       if (tab === 'activity') loadActivity();
+    }
+
+    // ===== Overview Servers =====
+    async function loadOverviewServers() {
+      const container = document.getElementById('overviewServers');
+      if (!container) return;
+      try {
+        const res = await fetch(API + '/status');
+        const data = await res.json();
+        const servers = data.servers || [];
+        if (servers.length === 0) {
+          container.innerHTML = '<p class="text-xs text-discord-muted">No servers connected yet.</p>';
+          return;
+        }
+        container.innerHTML = servers.map(s => \`
+          <div class="flex items-center gap-3 py-2 px-3 rounded-lg bg-white/[0.02] border border-white/5">
+            \${s.icon
+              ? \`<img src="https://cdn.discordapp.com/icons/\${s.id}/\${s.icon}.png?size=32" class="w-6 h-6 rounded-full flex-shrink-0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">\`
+              : ''}
+            <div class="w-6 h-6 bg-discord/10 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold text-discord" \${s.icon ? 'style="display:none"' : ''}>
+              \${(s.name || '?')[0].toUpperCase()}
+            </div>
+            <div class="flex-1 min-w-0">
+              <span class="text-sm text-white truncate block">\${s.name || 'Unknown'}</span>
+            </div>
+            <span class="text-[10px] text-discord-muted font-mono">\${s.id}</span>
+          </div>
+        \`).join('');
+      } catch(e) {
+        container.innerHTML = '<p class="text-xs text-red-400">Failed to load servers.</p>';
+      }
     }
 
     // ===== Rules =====
