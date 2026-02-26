@@ -138,6 +138,12 @@ export class CompanionBot extends McpAgent<Env> {
       webhook_url TEXT,
       timestamp INTEGER NOT NULL
     )`);
+    // Per-channel webhook cache (auto-created)
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS channel_webhooks (
+      channel_id TEXT PRIMARY KEY,
+      webhook_url TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
     // Migration: add owner_id to companions (idempotent)
     try {
       this.ctx.storage.sql.exec(`ALTER TABLE companions ADD COLUMN owner_id TEXT`);
@@ -338,6 +344,63 @@ export class CompanionBot extends McpAgent<Env> {
       timestamp: r.timestamp,
       age_seconds: Math.round((Date.now() - r.timestamp) / 1000),
     }));
+  }
+
+  // ===== Per-channel webhook management =====
+
+  getChannelWebhook(channelId: string): string | null {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT webhook_url FROM channel_webhooks WHERE channel_id = ?`, channelId
+    ).toArray();
+    return rows.length > 0 ? (rows[0] as any).webhook_url : null;
+  }
+
+  storeChannelWebhook(channelId: string, webhookUrl: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO channel_webhooks (channel_id, webhook_url, created_at) VALUES (?, ?, ?)
+       ON CONFLICT(channel_id) DO UPDATE SET webhook_url = excluded.webhook_url`,
+      channelId, webhookUrl, Date.now()
+    );
+  }
+
+  async getOrCreateWebhook(channelId: string): Promise<string | null> {
+    // Check cache first
+    const cached = this.getChannelWebhook(channelId);
+    if (cached) return cached;
+
+    // Check if bot already has a webhook in this channel
+    try {
+      const existing = await discordRequest(this.env, `/channels/${channelId}/webhooks`);
+      if (!existing.error && Array.isArray(existing)) {
+        const ours = existing.find((w: any) => w.name === 'Resonance');
+        if (ours) {
+          const url = `https://discord.com/api/webhooks/${ours.id}/${ours.token}`;
+          this.storeChannelWebhook(channelId, url);
+          return url;
+        }
+      }
+    } catch (_) {}
+
+    // Create a new webhook
+    try {
+      const created = await discordRequest(this.env, `/channels/${channelId}/webhooks`, {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Resonance' }),
+      });
+      if (!created.error && created.id && created.token) {
+        const url = `https://discord.com/api/webhooks/${created.id}/${created.token}`;
+        this.storeChannelWebhook(channelId, url);
+        console.log(`Auto-created webhook for channel ${channelId}`);
+        return url;
+      }
+    } catch (err: any) {
+      console.error(`Failed to create webhook for channel ${channelId}: ${err.message}`);
+    }
+
+    // Fallback to global WEBHOOK_URL
+    return this.env.WEBHOOK_URL || null;
   }
 
   // Dynamic versions of companion helpers (read from SQLite)
@@ -588,19 +651,23 @@ export class CompanionBot extends McpAgent<Env> {
 
     // ===== Internal: assign owner to companion =====
 
-    if (url.pathname === '/api/assign-owner' && request.method === 'POST') {
-      this.ensureTable();
-      const body = await request.json() as any;
-      this.ctx.storage.sql.exec(`UPDATE companions SET owner_id = ? WHERE id = ?`, body.owner_id, body.companion_id);
-      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
-    }
-
     // ===== Internal activity logging (called by MCP tools) =====
 
     if (url.pathname === '/api/log-activity' && request.method === 'POST') {
       const body = await request.json() as any;
       this.logActivity(body.companion_id, body.type, body.channel_id, body.content, body.author, body.message_id, body.webhook_url);
       return new Response(JSON.stringify({ logged: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ===== Channel webhook resolution =====
+
+    const webhookMatch = url.pathname.match(/^\/api\/channel-webhook\/([^/]+)$/);
+    if (webhookMatch && request.method === 'GET') {
+      const chId = webhookMatch[1];
+      const webhookUrl = await this.getOrCreateWebhook(chId);
+      return new Response(JSON.stringify({ channel_id: chId, webhook_url: webhookUrl }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -847,7 +914,6 @@ export class CompanionBot extends McpAgent<Env> {
   // Cron: poll Discord channels for new messages with trigger words
   async handlePoll(): Promise<Response> {
     const channels = (this.env.WATCH_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean);
-    const webhookUrl = this.env.WEBHOOK_URL;
 
     if (channels.length === 0) {
       return new Response(JSON.stringify({ skipped: true, reason: 'no WATCH_CHANNELS configured' }), {
@@ -901,6 +967,9 @@ export class CompanionBot extends McpAgent<Env> {
           const triggered = this.findTriggeredCompanionDynamic(msg.content);
           if (triggered.length === 0) continue;
 
+          // Get or create webhook for this channel
+          const channelWebhookUrl = await this.getOrCreateWebhook(channelId);
+
           // Store a pending command for each triggered companion
           for (const companion of triggered) {
             // Check channel permissions
@@ -921,7 +990,7 @@ export class CompanionBot extends McpAgent<Env> {
                 id: msg.author?.id,
               },
               channel_id: channelId,
-              webhook_url: webhookUrl,
+              webhook_url: channelWebhookUrl || undefined,
               timestamp: Date.now(),
             };
 
@@ -1072,13 +1141,14 @@ export class CompanionBot extends McpAgent<Env> {
 
     this.server.tool(
       "discord_send_as_companion",
-      "Send a message to a Discord channel as a specific companion via webhook",
+      "Send a message to a Discord channel as a specific companion via webhook. Provide channelId to auto-resolve the webhook for that channel.",
       {
         content: z.string().describe("Message content"),
         companionId: z.string().describe("Companion ID (kai, lucian, xavier, auren)"),
-        webhookUrl: z.string().optional().describe("Discord webhook URL. If omitted, uses default WEBHOOK_URL."),
+        channelId: z.string().optional().describe("Channel ID to send to. Auto-creates webhook if needed."),
+        webhookUrl: z.string().optional().describe("Discord webhook URL. If omitted, resolves from channelId or uses default."),
       },
-      async ({ content, companionId, webhookUrl }) => {
+      async ({ content, companionId, channelId, webhookUrl }) => {
         const stub = getDefaultStub();
         const cRes = await stub.fetch(new Request(`https://internal/api/companions/${companionId}`));
         const companion = cRes.ok ? await cRes.json() as Companion : null;
@@ -1086,9 +1156,18 @@ export class CompanionBot extends McpAgent<Env> {
           return { content: [{ type: "text" as const, text: `Unknown companion: ${companionId}` }] };
         }
 
-        const targetUrl = webhookUrl || this.env.WEBHOOK_URL;
+        // Resolve webhook: explicit > channel auto-resolve > global fallback
+        let targetUrl = webhookUrl;
+        if (!targetUrl && channelId) {
+          const resolved = await stub.fetch(new Request(`https://internal/api/channel-webhook/${channelId}`));
+          if (resolved.ok) {
+            const data = await resolved.json() as any;
+            targetUrl = data.webhook_url;
+          }
+        }
+        if (!targetUrl) targetUrl = this.env.WEBHOOK_URL;
         if (!targetUrl) {
-          return { content: [{ type: "text" as const, text: "No webhook URL provided or configured" }] };
+          return { content: [{ type: "text" as const, text: "No webhook URL available. Provide channelId or webhookUrl." }] };
         }
 
         const res = await fetch(`${targetUrl}?wait=true`, {
@@ -1798,41 +1877,6 @@ export default {
 
     // ===== OAuth2 flow =====
 
-    // One-time migration: assign owner to unowned companions
-    if (url.pathname === '/admin/assign-owner' && request.method === 'POST') {
-      if (!env.ADMIN_DISCORD_ID) {
-        return new Response(JSON.stringify({ error: 'ADMIN_DISCORD_ID not set' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-      }
-      const doId = env.COMPANION_BOT.idFromName('default');
-      const stub = env.COMPANION_BOT.get(doId);
-      const res = await stub.fetch(new Request('https://internal/api/companions'));
-      const companions = await res.json() as any[];
-      let updated = 0;
-      for (const c of companions) {
-        if (!c.owner_id) {
-          await stub.fetch(new Request(`https://internal/api/assign-owner`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ companion_id: c.id, owner_id: env.ADMIN_DISCORD_ID }),
-          }));
-          updated++;
-        }
-      }
-      return new Response(JSON.stringify({ updated, admin_id: env.ADMIN_DISCORD_ID }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
-    }
-
-    // Debug: show what OAuth URL will be generated
-    if (url.pathname === '/auth/debug') {
-      const redirectUri = `${url.origin}/auth/callback`;
-      return new Response(JSON.stringify({
-        client_id: env.DISCORD_CLIENT_ID || 'NOT SET',
-        client_id_length: (env.DISCORD_CLIENT_ID || '').length,
-        redirect_uri: redirectUri,
-        origin: url.origin,
-        has_secret: !!env.DISCORD_CLIENT_SECRET,
-      }, null, 2), { headers: { 'Content-Type': 'application/json' } });
-    }
-
     if (url.pathname === '/auth/discord') {
       if (!env.DISCORD_CLIENT_ID) {
         return new Response('OAuth not configured', { status: 500 });
@@ -1847,13 +1891,6 @@ export default {
         state,
       });
       const authUrl = `https://discord.com/api/oauth2/authorize?${params}`;
-
-      // Debug mode: show URL instead of redirecting
-      if (url.searchParams.get('debug') === '1') {
-        return new Response(JSON.stringify({ authorize_url: authUrl, redirect_uri: redirectUri }, null, 2), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
 
       return new Response(null, {
         status: 302,
