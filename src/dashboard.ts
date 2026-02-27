@@ -362,6 +362,7 @@ export function renderDashboard(baseUrl: string, clientId: string): string {
     <!-- Tabs -->
     <div class="flex gap-1 mb-6 border-b border-white/5">
       <button onclick="switchTab('companions')" id="tab-companions" class="tab-btn px-4 py-2.5 text-sm font-medium rounded-t-lg border-b-2 border-discord text-white">Companions</button>
+      <button onclick="switchTab('channels')" id="tab-channels" class="tab-btn px-4 py-2.5 text-sm font-medium rounded-t-lg border-b-2 border-transparent text-discord-muted hover:text-white">Channels</button>
       <button onclick="switchTab('pending')" id="tab-pending" class="tab-btn px-4 py-2.5 text-sm font-medium rounded-t-lg border-b-2 border-transparent text-discord-muted hover:text-white">Pending</button>
     </div>
 
@@ -373,6 +374,32 @@ export function renderDashboard(baseUrl: string, clientId: string): string {
       </div>
       <div id="companionGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
       <div id="emptyState" class="hidden text-center py-16"><p class="text-discord-muted">No companions yet.</p></div>
+    </div>
+
+    <!-- Channels panel -->
+    <div id="panel-channels" class="hidden fade-in">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-lg font-bold">Channel Access Control</h2>
+          <p class="text-xs text-discord-muted mt-1">Restrict sensitive channels. Restricted channels are blocked for all companions unless explicitly granted access.</p>
+        </div>
+        <div class="relative">
+          <button onclick="toggleChServerDropdown()" id="chServerBtn" class="inline-flex items-center gap-2 text-sm bg-white/5 border border-white/10 rounded-lg px-4 py-2 hover:bg-white/10 transition-colors text-discord-muted">
+            <span id="chServerLabel">Select server...</span>
+            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+          </button>
+          <div id="chServerDropdown" class="hidden absolute right-0 top-full mt-2 w-72 bg-discord-dark border border-white/10 rounded-xl shadow-2xl z-40 overflow-hidden fade-in">
+            <div class="px-4 py-2.5 border-b border-white/5 text-xs font-semibold text-discord-muted uppercase tracking-wider">Select Server</div>
+            <div id="chServerList" class="max-h-64 overflow-y-auto py-1"></div>
+          </div>
+        </div>
+      </div>
+      <div id="channelPanel">
+        <div class="text-center py-12">
+          <svg class="w-12 h-12 text-discord-muted/30 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 20l4-16m2 16l4-16M6 9h14M4 15h14"/></svg>
+          <p class="text-discord-muted text-sm">Select a server to manage channel restrictions.</p>
+        </div>
+      </div>
     </div>
 
     <!-- Pending panel -->
@@ -408,8 +435,10 @@ export function renderDashboard(baseUrl: string, clientId: string): string {
       document.getElementById('tab-'+tab).classList.add('border-discord','text-white');
       document.getElementById('tab-'+tab).classList.remove('border-transparent','text-discord-muted');
       document.getElementById('panel-companions').classList.toggle('hidden', tab !== 'companions');
+      document.getElementById('panel-channels').classList.toggle('hidden', tab !== 'channels');
       document.getElementById('panel-pending').classList.toggle('hidden', tab !== 'pending');
       if (tab === 'pending') loadPending();
+      if (tab === 'channels') loadChServers();
     }
 
     async function loadCompanions() {
@@ -582,6 +611,221 @@ export function renderDashboard(baseUrl: string, clientId: string): string {
 
     document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeCropper(); } });
     document.getElementById('modal').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
+
+    // ===== Channel Access Control =====
+    let chServers = [];
+    let selectedGuildId = null;
+    let guildChannels = [];
+    let restrictedChannels = [];
+    let expandedChannel = null;
+
+    async function loadChServers() {
+      try {
+        const res = await fetch(API + '/status');
+        const data = await res.json();
+        chServers = data.servers || [];
+        const list = document.getElementById('chServerList');
+        if (chServers.length === 0) {
+          list.innerHTML = '<p class="text-sm text-discord-muted px-4 py-3">No servers found.</p>';
+          return;
+        }
+        list.innerHTML = chServers.map(sv => \`
+          <button onclick="selectChServer('\${sv.id}', '\${sv.name.replace(/'/g, "\\\\'")}')\" class="flex items-center gap-3 px-4 py-2 w-full text-left hover:bg-white/5 transition-colors \${selectedGuildId === sv.id ? 'bg-discord/10' : ''}">
+            \${sv.icon
+              ? \`<img src="\${sv.icon}" class="w-7 h-7 rounded-full flex-shrink-0" alt="">\`
+              : \`<div class="w-7 h-7 rounded-full bg-discord/20 flex items-center justify-center flex-shrink-0 text-xs font-bold text-discord">\${sv.name.charAt(0)}</div>\`
+            }
+            <div class="min-w-0">
+              <div class="text-sm text-white truncate">\${sv.name}</div>
+              <div class="text-[10px] text-discord-muted font-mono">\${sv.id}</div>
+            </div>
+          </button>
+        \`).join('');
+      } catch(e) {}
+    }
+
+    function toggleChServerDropdown() {
+      const dd = document.getElementById('chServerDropdown');
+      dd.classList.toggle('hidden');
+    }
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('chServerDropdown');
+      const btn = document.getElementById('chServerBtn');
+      if (dd && btn && !btn.contains(e.target) && !dd.contains(e.target)) dd.classList.add('hidden');
+    });
+
+    async function selectChServer(guildId, guildName) {
+      selectedGuildId = guildId;
+      document.getElementById('chServerLabel').textContent = guildName;
+      document.getElementById('chServerDropdown').classList.add('hidden');
+      await loadGuildChannels(guildId);
+    }
+
+    async function loadGuildChannels(guildId) {
+      const panel = document.getElementById('channelPanel');
+      panel.innerHTML = '<p class="text-sm text-discord-muted py-8 text-center">Loading channels...</p>';
+      try {
+        const [chRes, restrictedRes] = await Promise.all([
+          fetch(API + '/guild-channels/' + guildId),
+          fetch(API + '/restricted-channels/' + guildId)
+        ]);
+        guildChannels = await chRes.json();
+        restrictedChannels = await restrictedRes.json();
+
+        const restrictedIds = new Set(restrictedChannels.map(r => r.channel_id));
+        const categories = guildChannels.filter(c => c.type === 'category');
+        const textChannels = guildChannels.filter(c => c.type === 'text' || c.type === 'announcement' || c.type === 'forum');
+        const uncategorized = textChannels.filter(c => !c.parent_id);
+        const byCategory = {};
+        for (const ch of textChannels) {
+          if (ch.parent_id) {
+            if (!byCategory[ch.parent_id]) byCategory[ch.parent_id] = [];
+            byCategory[ch.parent_id].push(ch);
+          }
+        }
+
+        let html = '';
+
+        function renderChannel(ch) {
+          const isRestricted = restrictedIds.has(ch.id);
+          const isExpanded = expandedChannel === ch.id;
+          return \`
+            <div class="rounded-lg border \${isRestricted ? 'border-red-500/20 bg-red-500/[0.03]' : 'border-white/5 bg-white/[0.02]'} overflow-hidden">
+              <div class="flex items-center justify-between py-2.5 px-3">
+                <button onclick="toggleChannelExpand('\${ch.id}')" class="flex items-center gap-2 flex-1 text-left">
+                  \${isRestricted
+                    ? '<svg class="w-4 h-4 text-red-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>'
+                    : '<svg class="w-4 h-4 text-discord-muted flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 20l4-16m2 16l4-16M6 9h14M4 15h14"/></svg>'
+                  }
+                  <span class="text-sm \${isRestricted ? 'text-red-300' : 'text-white'}">\${ch.name}</span>
+                  <span class="text-[10px] text-discord-muted font-mono">\${ch.id}</span>
+                </button>
+                <button onclick="toggleRestriction('\${ch.id}', \${isRestricted})" class="text-xs px-3 py-1 rounded-full font-medium transition-all \${isRestricted
+                  ? 'bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20'
+                  : 'bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20'
+                }">
+                  \${isRestricted ? 'Restricted' : 'Open'}
+                </button>
+              </div>
+              \${isRestricted && isExpanded ? \`<div id="exceptions-\${ch.id}" class="border-t border-white/5 px-3 py-3 bg-black/20"><p class="text-xs text-discord-muted">Loading exceptions...</p></div>\` : ''}
+            </div>
+          \`;
+        }
+
+        if (uncategorized.length > 0) {
+          html += '<div class="mb-4"><p class="text-xs font-semibold text-discord-muted uppercase tracking-wider mb-2">No Category</p><div class="space-y-1.5">' + uncategorized.map(renderChannel).join('') + '</div></div>';
+        }
+        for (const cat of categories) {
+          const children = byCategory[cat.id] || [];
+          if (children.length === 0) continue;
+          html += \`<div class="mb-4"><p class="text-xs font-semibold text-discord-muted uppercase tracking-wider mb-2">\${cat.name}</p><div class="space-y-1.5">\${children.map(renderChannel).join('')}</div></div>\`;
+        }
+
+        if (!html) html = '<p class="text-sm text-discord-muted py-8 text-center">No text channels found.</p>';
+        panel.innerHTML = html;
+
+        if (expandedChannel && restrictedIds.has(expandedChannel)) {
+          loadExceptions(expandedChannel, guildId);
+        }
+      } catch(e) {
+        panel.innerHTML = '<p class="text-sm text-red-400 py-8 text-center">Failed to load channels.</p>';
+      }
+    }
+
+    async function toggleRestriction(channelId, currentlyRestricted) {
+      if (!selectedGuildId) return;
+      try {
+        if (currentlyRestricted) {
+          await fetch(API + '/restricted-channels', {
+            method: 'DELETE', headers: getHeaders(),
+            body: JSON.stringify({ channel_id: channelId, guild_id: selectedGuildId })
+          });
+          if (expandedChannel === channelId) expandedChannel = null;
+          showToast('Channel unrestricted');
+        } else {
+          await fetch(API + '/restricted-channels', {
+            method: 'POST', headers: getHeaders(),
+            body: JSON.stringify({ channel_id: channelId, guild_id: selectedGuildId, restricted_by: currentUser?.id })
+          });
+          showToast('Channel restricted');
+        }
+        await loadGuildChannels(selectedGuildId);
+      } catch(e) { showToast('Failed'); }
+    }
+
+    function toggleChannelExpand(channelId) {
+      const restrictedIds = new Set(restrictedChannels.map(r => r.channel_id));
+      if (!restrictedIds.has(channelId)) return;
+      expandedChannel = expandedChannel === channelId ? null : channelId;
+      loadGuildChannels(selectedGuildId);
+    }
+
+    async function loadExceptions(channelId, guildId) {
+      const container = document.getElementById('exceptions-' + channelId);
+      if (!container) return;
+      try {
+        const [excRes, compRes] = await Promise.all([
+          fetch(API + '/channel-exceptions/' + channelId + '/' + guildId),
+          fetch(API + '/companions')
+        ]);
+        const exceptions = await excRes.json();
+        const allCompanions = await compRes.json();
+        const exCompanionIds = new Set(exceptions.map(e => e.companion_id));
+        const available = allCompanions.filter(c => !exCompanionIds.has(c.id));
+
+        let html = '<p class="text-xs font-semibold text-discord-muted mb-2">Companions with access:</p>';
+        if (exceptions.length === 0) {
+          html += '<p class="text-xs text-discord-muted mb-3">No companions have access to this restricted channel.</p>';
+        } else {
+          html += '<div class="space-y-1 mb-3">' + exceptions.map(ex => {
+            const comp = allCompanions.find(c => c.id === ex.companion_id);
+            return \`<div class="flex items-center justify-between py-1.5 px-2 rounded bg-white/[0.03]">
+              <div class="flex items-center gap-2">
+                \${comp ? \`<img src="\${comp.avatar_url}" class="w-5 h-5 rounded-full" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">\` : ''}
+                <span class="text-xs text-white">\${comp ? comp.name : ex.companion_id}</span>
+              </div>
+              <button onclick="revokeException('\${ex.companion_id}', '\${channelId}', '\${guildId}')" class="text-[10px] text-red-400 hover:text-red-300 transition-colors">Revoke</button>
+            </div>\`;
+          }).join('') + '</div>';
+        }
+        if (available.length > 0) {
+          html += \`<div class="flex items-center gap-2">
+            <select id="grantSelect-\${channelId}" class="text-xs bg-discord-input border border-white/10 rounded-lg px-2 py-1.5 text-white flex-1">
+              \${available.map(c => \`<option value="\${c.id}">\${c.name}</option>\`).join('')}
+            </select>
+            <button onclick="grantException('\${channelId}', '\${guildId}')" class="text-xs bg-discord/10 text-discord border border-discord/20 rounded-lg px-3 py-1.5 hover:bg-discord/20 transition-colors">Grant</button>
+          </div>\`;
+        }
+        container.innerHTML = html;
+      } catch(e) {
+        container.innerHTML = '<p class="text-xs text-red-400">Failed to load.</p>';
+      }
+    }
+
+    async function grantException(channelId, guildId) {
+      const select = document.getElementById('grantSelect-' + channelId);
+      if (!select) return;
+      const companionId = select.value;
+      try {
+        await fetch(API + '/channel-exceptions', {
+          method: 'POST', headers: getHeaders(),
+          body: JSON.stringify({ companion_id: companionId, channel_id: channelId, guild_id: guildId, granted_by: currentUser?.id })
+        });
+        showToast('Access granted');
+        loadExceptions(channelId, guildId);
+      } catch(e) { showToast('Failed'); }
+    }
+
+    async function revokeException(companionId, channelId, guildId) {
+      try {
+        await fetch(API + '/channel-exceptions', {
+          method: 'DELETE', headers: getHeaders(),
+          body: JSON.stringify({ companion_id: companionId, channel_id: channelId, guild_id: guildId })
+        });
+        showToast('Access revoked');
+        loadExceptions(channelId, guildId);
+      } catch(e) { showToast('Failed'); }
+    }
 
     function onAuthReady() {
       if (!currentUser || !currentUser.is_admin) {
@@ -1136,12 +1380,13 @@ export function renderRegisterPage(baseUrl: string, clientId: string): string {
     // ===== Channels =====
     let watchedChannels = [];
     let blockedChannels = [];
+    let adminRestricted = new Set();
 
     async function loadChannels() {
       if (!myCompanion) return;
       const list = document.getElementById('channelList');
       try {
-        // Load status (watched channels) and blocked channels in parallel
+        // Load status (watched channels), blocked channels, and restricted channels in parallel
         const [statusRes, blockedRes] = await Promise.all([
           fetch(API + '/status'),
           fetch(API + '/companions/' + myCompanion.id + '/channels')
@@ -1151,13 +1396,37 @@ export function renderRegisterPage(baseUrl: string, clientId: string): string {
         watchedChannels = statusData.watch_channels || [];
         blockedChannels = blockedData.blocked_channels || [];
 
+        // Fetch restricted channels for each guild the watched channels belong to
+        adminRestricted = new Set();
+        const guildIds = [...new Set(watchedChannels.map(ch => ch.guild_id).filter(Boolean))];
+        for (const guildId of guildIds) {
+          try {
+            const rRes = await fetch(API + '/restricted-channels/' + guildId);
+            const restricted = await rRes.json();
+            for (const r of restricted) adminRestricted.add(r.channel_id);
+          } catch(_) {}
+        }
+
         if (watchedChannels.length === 0) {
           list.innerHTML = '<p class="text-sm text-discord-muted">No watched channels configured.</p>';
           return;
         }
 
         list.innerHTML = watchedChannels.map(ch => {
+          const isAdminRestricted = adminRestricted.has(ch.id);
           const isBlocked = blockedChannels.includes(ch.id);
+          if (isAdminRestricted) {
+            return \`
+              <div class="flex items-center justify-between py-2.5 px-3 rounded-lg bg-red-500/[0.03] border border-red-500/10 opacity-60">
+                <div class="flex items-center gap-2">
+                  <svg class="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                  <span class="text-sm text-red-300">\${ch.name || ch.id}</span>
+                  \${ch.guild_id ? \`<span class="text-[10px] text-discord-muted">\${ch.guild_id}</span>\` : ''}
+                </div>
+                <span class="text-[10px] text-red-400/60 px-2 py-0.5 rounded-full border border-red-500/10">Restricted by admin</span>
+              </div>
+            \`;
+          }
           return \`
             <div class="flex items-center justify-between py-2.5 px-3 rounded-lg bg-white/[0.02] border border-white/5">
               <div class="flex items-center gap-2">
