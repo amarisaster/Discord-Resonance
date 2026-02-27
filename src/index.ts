@@ -61,6 +61,28 @@ async function discordRequest(env: Env, endpoint: string, options: RequestInit =
   return response.json();
 }
 
+// Helper: Split long messages at Discord's 2000 character limit
+function splitMessage(content: string, maxLength: number = 2000): string[] {
+  if (content.length <= maxLength) return [content];
+  const chunks: string[] = [];
+  let remaining = content;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to split at last newline before limit
+    let splitAt = remaining.lastIndexOf('\n', maxLength);
+    // If no newline, try last space
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf(' ', maxLength);
+    // If still nothing, hard split
+    if (splitAt <= 0) splitAt = maxLength;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n/, '');
+  }
+  return chunks;
+}
+
 // ========== Durable Object: CompanionBot ==========
 
 export class CompanionBot extends McpAgent<Env> {
@@ -180,6 +202,23 @@ export class CompanionBot extends McpAgent<Env> {
       channel_id TEXT PRIMARY KEY,
       guild_id TEXT NOT NULL,
       cached_at INTEGER NOT NULL
+    )`);
+    // Admin-controlled restricted channels — blocked for all companions unless exception granted
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS restricted_channels (
+      channel_id TEXT NOT NULL,
+      guild_id TEXT NOT NULL,
+      restricted_by TEXT,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (channel_id, guild_id)
+    )`);
+    // Per-companion exceptions for restricted channels (admin-granted only)
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS channel_exceptions (
+      companion_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      guild_id TEXT NOT NULL,
+      granted_by TEXT,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (companion_id, channel_id, guild_id)
     )`);
     // Migration: add owner_id to companions (idempotent)
     try {
@@ -384,6 +423,15 @@ export class CompanionBot extends McpAgent<Env> {
     }));
   }
 
+  // Look up which companion sent a message by its Discord message_id (for reply detection)
+  getCompanionByMessageId(messageId: string): string | null {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT companion_id FROM companion_activity WHERE message_id = ? LIMIT 1`, messageId
+    ).toArray();
+    return rows.length > 0 ? (rows[0] as any).companion_id : null;
+  }
+
   // ===== Entity permission model =====
 
   getEntityServerConfig(entityId: string, guildId: string): any | null {
@@ -500,6 +548,12 @@ export class CompanionBot extends McpAgent<Env> {
 
     // Check channel permissions
     if (channelId) {
+      // Check server-wide restricted channels FIRST (admin override)
+      if (this.isChannelRestricted(channelId, guildId)) {
+        if (!this.hasChannelException(entityId, channelId, guildId)) {
+          return { allowed: false, reason: `Channel ${channelId} is restricted — admin exception required` };
+        }
+      }
       if (config.blocked_channels && config.blocked_channels.includes(channelId)) {
         return { allowed: false, reason: `Channel ${channelId} is blocked for entity ${entityId} in guild ${guildId}` };
       }
@@ -557,6 +611,78 @@ export class CompanionBot extends McpAgent<Env> {
       active: row.active === 1,
       created_at: row.created_at,
       updated_at: row.updated_at,
+    }));
+  }
+
+  // ===== Restricted channels (admin-controlled) =====
+
+  isChannelRestricted(channelId: string, guildId: string): boolean {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT 1 FROM restricted_channels WHERE channel_id = ? AND guild_id = ?`, channelId, guildId
+    ).toArray();
+    return rows.length > 0;
+  }
+
+  hasChannelException(companionId: string, channelId: string, guildId: string): boolean {
+    this.ensureTable();
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT 1 FROM channel_exceptions WHERE companion_id = ? AND channel_id = ? AND guild_id = ?`, companionId, channelId, guildId
+    ).toArray();
+    return rows.length > 0;
+  }
+
+  getRestrictedChannels(guildId: string): any[] {
+    this.ensureTable();
+    return this.ctx.storage.sql.exec(
+      `SELECT * FROM restricted_channels WHERE guild_id = ? ORDER BY created_at ASC`, guildId
+    ).toArray().map((r: any) => ({
+      channel_id: r.channel_id,
+      guild_id: r.guild_id,
+      restricted_by: r.restricted_by,
+      created_at: r.created_at,
+    }));
+  }
+
+  setChannelRestricted(channelId: string, guildId: string, restrictedBy?: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO restricted_channels (channel_id, guild_id, restricted_by, created_at) VALUES (?, ?, ?, ?)`,
+      channelId, guildId, restrictedBy || null, Date.now()
+    );
+  }
+
+  removeChannelRestriction(channelId: string, guildId: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(`DELETE FROM restricted_channels WHERE channel_id = ? AND guild_id = ?`, channelId, guildId);
+    this.ctx.storage.sql.exec(`DELETE FROM channel_exceptions WHERE channel_id = ? AND guild_id = ?`, channelId, guildId);
+  }
+
+  grantChannelException(companionId: string, channelId: string, guildId: string, grantedBy?: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO channel_exceptions (companion_id, channel_id, guild_id, granted_by, created_at) VALUES (?, ?, ?, ?, ?)`,
+      companionId, channelId, guildId, grantedBy || null, Date.now()
+    );
+  }
+
+  revokeChannelException(companionId: string, channelId: string, guildId: string) {
+    this.ensureTable();
+    this.ctx.storage.sql.exec(
+      `DELETE FROM channel_exceptions WHERE companion_id = ? AND channel_id = ? AND guild_id = ?`, companionId, channelId, guildId
+    );
+  }
+
+  getChannelExceptions(channelId: string, guildId: string): any[] {
+    this.ensureTable();
+    return this.ctx.storage.sql.exec(
+      `SELECT * FROM channel_exceptions WHERE channel_id = ? AND guild_id = ? ORDER BY created_at ASC`, channelId, guildId
+    ).toArray().map((r: any) => ({
+      companion_id: r.companion_id,
+      channel_id: r.channel_id,
+      guild_id: r.guild_id,
+      granted_by: r.granted_by,
+      created_at: r.created_at,
     }));
   }
 
@@ -1149,6 +1275,71 @@ export class CompanionBot extends McpAgent<Env> {
       return new Response(JSON.stringify(log), { headers: { 'Content-Type': 'application/json' } });
     }
 
+    // ===== Restricted channels API =====
+
+    // Get guild channels from Discord API (for dashboard channel listing)
+    const guildChannelsMatch = url.pathname.match(/^\/api\/guild-channels\/(\d+)$/);
+    if (guildChannelsMatch && request.method === 'GET') {
+      const guildId = guildChannelsMatch[1];
+      const channels = await discordRequest(this.env, `/guilds/${guildId}/channels`);
+      if (channels.error) {
+        return new Response(JSON.stringify(channels), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const channelTypes: Record<number, string> = { 0: 'text', 2: 'voice', 4: 'category', 5: 'announcement', 13: 'stage', 15: 'forum' };
+      const mapped = (channels as any[]).map((c: any) => ({
+        id: c.id, name: c.name, type: channelTypes[c.type] || String(c.type),
+        parent_id: c.parent_id, position: c.position,
+      })).sort((a: any, b: any) => a.position - b.position);
+      return new Response(JSON.stringify(mapped), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Get restricted channels for a guild
+    const restrictedListMatch = url.pathname.match(/^\/api\/restricted-channels\/(\d+)$/);
+    if (restrictedListMatch && request.method === 'GET') {
+      const restricted = this.getRestrictedChannels(restrictedListMatch[1]);
+      return new Response(JSON.stringify(restricted), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Set/remove channel restriction (admin only)
+    if (url.pathname === '/api/restricted-channels' && request.method === 'POST') {
+      const body = await request.json() as { channel_id: string; guild_id: string; restricted_by?: string };
+      this.setChannelRestricted(body.channel_id, body.guild_id, body.restricted_by);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/api/restricted-channels' && request.method === 'DELETE') {
+      const body = await request.json() as { channel_id: string; guild_id: string };
+      this.removeChannelRestriction(body.channel_id, body.guild_id);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Check if a specific channel is restricted (with optional companion exception check)
+    const channelRestrictedMatch = url.pathname.match(/^\/api\/channel-restricted\/(\d+)\/(\d+)$/);
+    if (channelRestrictedMatch && request.method === 'GET') {
+      const [, channelId, guildId] = channelRestrictedMatch;
+      const companionId = url.searchParams.get('companion_id');
+      const restricted = this.isChannelRestricted(channelId, guildId);
+      const hasException = companionId ? this.hasChannelException(companionId, channelId, guildId) : false;
+      return new Response(JSON.stringify({ restricted, has_exception: hasException }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Get/grant/revoke channel exceptions
+    const exceptionsMatch = url.pathname.match(/^\/api\/channel-exceptions\/(\d+)\/(\d+)$/);
+    if (exceptionsMatch && request.method === 'GET') {
+      const [, channelId, guildId] = exceptionsMatch;
+      const exceptions = this.getChannelExceptions(channelId, guildId);
+      return new Response(JSON.stringify(exceptions), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/api/channel-exceptions' && request.method === 'POST') {
+      const body = await request.json() as { companion_id: string; channel_id: string; guild_id: string; granted_by?: string };
+      this.grantChannelException(body.companion_id, body.channel_id, body.guild_id, body.granted_by);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/api/channel-exceptions' && request.method === 'DELETE') {
+      const body = await request.json() as { companion_id: string; channel_id: string; guild_id: string };
+      this.revokeChannelException(body.companion_id, body.channel_id, body.guild_id);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
     // Status endpoint — includes server/channel info
     if (url.pathname === '/api/status' && request.method === 'GET') {
       const pending = this.getPending();
@@ -1310,14 +1501,27 @@ export class CompanionBot extends McpAgent<Env> {
           continue;
         }
 
-        // Check each message for trigger words
+        // Check each message for trigger words or replies to companion messages
         for (const msg of messages) {
           // Skip bot messages and webhooks
           if (msg.author?.bot || msg.webhook_id) continue;
           // Skip empty messages
           if (!msg.content) continue;
 
-          const triggered = this.findTriggeredCompanionDynamic(msg.content);
+          let triggered = this.findTriggeredCompanionDynamic(msg.content);
+
+          // Reply detection: if no trigger words matched but message is a reply, check if it's replying to a companion
+          if (triggered.length === 0 && msg.message_reference?.message_id) {
+            const repliedCompanionId = this.getCompanionByMessageId(msg.message_reference.message_id);
+            if (repliedCompanionId) {
+              const companion = this.getCompanionById(repliedCompanionId);
+              if (companion) {
+                triggered = [companion];
+                console.log(`Cron: reply detection — ${companion.name} triggered by reply from ${msg.author?.username}`);
+              }
+            }
+          }
+
           if (triggered.length === 0) continue;
 
           // Get or create webhook for this channel
@@ -1331,6 +1535,14 @@ export class CompanionBot extends McpAgent<Env> {
 
           // Store a pending command for each triggered companion
           for (const companion of triggered) {
+            // Check admin-restricted channels (highest priority)
+            if (guildIdForEntity && this.isChannelRestricted(channelId, guildIdForEntity)) {
+              if (!this.hasChannelException(companion.id, channelId, guildIdForEntity)) {
+                console.log(`Cron: ${companion.name} blocked — channel ${channelId} is restricted`);
+                continue;
+              }
+            }
+
             // Check channel permissions (legacy blocklist)
             if (this.isChannelBlocked(companion.id, channelId)) {
               console.log(`Cron: ${companion.name} blocked in channel ${channelId}, skipping`);
@@ -1498,8 +1710,21 @@ export class CompanionBot extends McpAgent<Env> {
         requestId: z.string().optional().describe("(respond) The request ID from pending_commands get"),
         response: z.string().optional().describe("(respond) The companion's response message"),
         webhookUrl: z.string().optional().describe("(respond) Discord webhook URL override"),
+        embeds: z.array(z.object({
+          title: z.string().optional(),
+          description: z.string().optional(),
+          color: z.number().optional(),
+          fields: z.array(z.object({
+            name: z.string(),
+            value: z.string(),
+            inline: z.boolean().optional(),
+          })).optional(),
+          footer: z.object({ text: z.string() }).optional(),
+          thumbnail: z.object({ url: z.string() }).optional(),
+          image: z.object({ url: z.string() }).optional(),
+        })).optional().describe("(respond) Optional Discord embeds to include with the response"),
       },
-      async ({ action, entity_id, requestId, response, webhookUrl }: any) => {
+      async ({ action, entity_id, requestId, response, webhookUrl, embeds }: any) => {
         const stub = getDefaultStub();
 
         switch (action) {
@@ -1544,38 +1769,59 @@ export class CompanionBot extends McpAgent<Env> {
             if (!companion) {
               return { content: [{ type: "text" as const, text: `Unknown companion: ${command.companion_id}` }] };
             }
+            // Check restricted channels before responding
+            try {
+              const guildRes = await stub.fetch(new Request(`https://internal/api/resolve-guild/${command.channel_id}`));
+              const guildData = await guildRes.json() as any;
+              if (guildData.guild_id) {
+                const restrictedRes = await stub.fetch(new Request(`https://internal/api/channel-restricted/${command.channel_id}/${guildData.guild_id}?companion_id=${command.companion_id}`));
+                const restrictedData = await restrictedRes.json() as any;
+                if (restrictedData.restricted && !restrictedData.has_exception) {
+                  return { content: [{ type: "text" as const, text: `Channel is restricted — admin exception required for ${command.companion_id}` }] };
+                }
+              }
+            } catch (_) {}
             const targetWebhookUrl = webhookUrl || command.webhook_url;
             let sendResult: string;
-            let sentMessageId: string | undefined;
+            const sentMessageIds: string[] = [];
             let sentWebhookUrl: string | undefined;
             if (targetWebhookUrl) {
-              const res = await fetch(`${targetWebhookUrl}?wait=true`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  content: response,
+              const chunks = splitMessage(response);
+              for (let i = 0; i < chunks.length; i++) {
+                const isLast = i === chunks.length - 1;
+                const webhookPayload: any = {
+                  content: chunks[i],
                   username: companion.name,
                   avatar_url: companion.avatar_url,
-                }),
-              });
-              if (!res.ok) {
-                const errText = await res.text();
-                return { content: [{ type: "text" as const, text: `Webhook failed (${res.status}): ${errText}` }] };
+                };
+                if (isLast && embeds) webhookPayload.embeds = embeds;
+                const res = await fetch(`${targetWebhookUrl}?wait=true`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(webhookPayload),
+                });
+                if (!res.ok) {
+                  const errText = await res.text();
+                  return { content: [{ type: "text" as const, text: `Webhook failed on chunk ${i + 1}/${chunks.length} (${res.status}): ${errText}` }] };
+                }
+                const msgData = await res.json() as any;
+                sentMessageIds.push(msgData.id);
               }
-              const msgData = await res.json() as any;
-              sentMessageId = msgData.id;
               sentWebhookUrl = targetWebhookUrl;
-              sendResult = `via webhook as ${companion.name} (message_id: ${sentMessageId})`;
+              sendResult = `via webhook as ${companion.name} (${chunks.length} message${chunks.length > 1 ? 's' : ''}, ids: ${sentMessageIds.join(', ')})`;
             } else {
-              const result = await discordRequest(this.env, `/channels/${command.channel_id}/messages`, {
-                method: 'POST',
-                body: JSON.stringify({ content: `**${companion.name}:** ${response}` }),
-              });
-              if (result.error) {
-                return { content: [{ type: "text" as const, text: `Discord API error: ${JSON.stringify(result)}` }] };
+              const chunks = splitMessage(`**${companion.name}:** ${response}`);
+              for (const chunk of chunks) {
+                const result = await discordRequest(this.env, `/channels/${command.channel_id}/messages`, {
+                  method: 'POST',
+                  body: JSON.stringify({ content: chunk }),
+                });
+                if (result.error) {
+                  return { content: [{ type: "text" as const, text: `Discord API error: ${JSON.stringify(result)}` }] };
+                }
+                sentMessageIds.push(result.id);
               }
-              sentMessageId = result.id;
-              sendResult = `via API to channel ${command.channel_id} (message_id: ${sentMessageId})`;
+              sendResult = `via API to channel ${command.channel_id} (${chunks.length} message${chunks.length > 1 ? 's' : ''}, ids: ${sentMessageIds.join(', ')})`;
             }
             await stub.fetch(new Request('https://internal/api/log-activity', {
               method: 'POST',
@@ -1586,7 +1832,7 @@ export class CompanionBot extends McpAgent<Env> {
                 channel_id: command.channel_id,
                 content: response.substring(0, 200),
                 author: companion.name,
-                message_id: sentMessageId,
+                message_id: sentMessageIds[sentMessageIds.length - 1],
                 webhook_url: sentWebhookUrl,
               }),
             }));
@@ -1615,8 +1861,21 @@ export class CompanionBot extends McpAgent<Env> {
         webhookUrl: z.string().optional().describe("(send/edit_message/delete_message) Webhook URL override"),
         messageId: z.string().optional().describe("(edit_message/delete_message) The Discord message ID"),
         newContent: z.string().optional().describe("(edit_message) New message content"),
+        embeds: z.array(z.object({
+          title: z.string().optional(),
+          description: z.string().optional(),
+          color: z.number().optional(),
+          fields: z.array(z.object({
+            name: z.string(),
+            value: z.string(),
+            inline: z.boolean().optional(),
+          })).optional(),
+          footer: z.object({ text: z.string() }).optional(),
+          thumbnail: z.object({ url: z.string() }).optional(),
+          image: z.object({ url: z.string() }).optional(),
+        })).optional().describe("(send) Optional Discord embeds to include with the message"),
       },
-      async ({ action, entity_id, content, companionId, channelId, webhookUrl, messageId, newContent }: any) => {
+      async ({ action, entity_id, content, companionId, channelId, webhookUrl, messageId, newContent, embeds }: any) => {
         const stub = getDefaultStub();
 
         switch (action) {
@@ -1655,23 +1914,48 @@ export class CompanionBot extends McpAgent<Env> {
             if (!targetUrl) {
               return { content: [{ type: "text" as const, text: "No webhook URL available. Provide channelId or webhookUrl." }] };
             }
-            const res = await fetch(`${targetUrl}?wait=true`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ content, username: companion.name, avatar_url: companion.avatar_url }),
-            });
-            if (!res.ok) {
-              const errText = await res.text();
-              return { content: [{ type: "text" as const, text: `Failed: ${res.status} ${errText}` }] };
+            // Check restricted channels for companion sends
+            if (channelId) {
+              try {
+                const guildRes = await stub.fetch(new Request(`https://internal/api/resolve-guild/${channelId}`));
+                const guildData = await guildRes.json() as any;
+                if (guildData.guild_id) {
+                  const restrictedRes = await stub.fetch(new Request(`https://internal/api/channel-restricted/${channelId}/${guildData.guild_id}?companion_id=${companionId}`));
+                  const restrictedData = await restrictedRes.json() as any;
+                  if (restrictedData.restricted && !restrictedData.has_exception) {
+                    return { content: [{ type: "text" as const, text: `Channel is restricted — admin exception required for ${companionId}` }] };
+                  }
+                }
+              } catch (_) {}
             }
-            const msgData = await res.json() as any;
-            const sentMessageId = msgData.id;
+            const chunks = splitMessage(content);
+            const sentMessageIds: string[] = [];
+            for (let i = 0; i < chunks.length; i++) {
+              const isLast = i === chunks.length - 1;
+              const webhookPayload: any = {
+                content: chunks[i],
+                username: companion.name,
+                avatar_url: companion.avatar_url,
+              };
+              if (isLast && embeds) webhookPayload.embeds = embeds;
+              const res = await fetch(`${targetUrl}?wait=true`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(webhookPayload),
+              });
+              if (!res.ok) {
+                const errText = await res.text();
+                return { content: [{ type: "text" as const, text: `Failed on chunk ${i + 1}/${chunks.length}: ${res.status} ${errText}` }] };
+              }
+              const msgData = await res.json() as any;
+              sentMessageIds.push(msgData.id);
+            }
             await stub.fetch(new Request('https://internal/api/log-activity', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ companion_id: companionId, type: 'sent', content: content.substring(0, 200), author: companion.name, message_id: sentMessageId, webhook_url: targetUrl }),
+              body: JSON.stringify({ companion_id: companionId, type: 'sent', content: content.substring(0, 200), author: companion.name, message_id: sentMessageIds[sentMessageIds.length - 1], webhook_url: targetUrl }),
             }));
-            return { content: [{ type: "text" as const, text: `Sent as ${companion.name} (message_id: ${sentMessageId})` }] };
+            return { content: [{ type: "text" as const, text: `Sent as ${companion.name} (${chunks.length} message${chunks.length > 1 ? 's' : ''}, ids: ${sentMessageIds.join(', ')})` }] };
           }
 
           case "edit_message": {

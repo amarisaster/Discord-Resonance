@@ -2,6 +2,42 @@
 
 ## 2026-02-27
 
+### Session: Message Handling + Restricted Channels (Wren)
+
+**Message Splitting:**
+- `splitMessage()` helper — splits at newlines > spaces > hard cut at 2000 char limit
+- Applied to `pending_commands` respond and `companion` send webhook dispatches
+- Each chunk sent as separate webhook call, all message IDs returned
+- Fixes silent failures when AI generates responses > 2000 chars
+
+**Reply Detection:**
+- `getCompanionByMessageId()` method — looks up `companion_activity` table for message author
+- Cron `handlePoll()` now checks `msg.message_reference` when no trigger words match
+- If someone replies to a companion's message without saying their name, it still triggers
+
+**Embed Support:**
+- Optional `embeds` param added to `pending_commands` respond and `companion` send schemas
+- Full Discord embed schema (title, description, color, fields, footer, thumbnail, image)
+- Embeds attach to last chunk when message splitting is active
+
+**Restricted Channels (Admin Dashboard):**
+- 2 new SQLite tables: `restricted_channels`, `channel_exceptions`
+- 8 new CompanionBot methods for restriction CRUD + exception management
+- 7 new API routes: `/api/guild-channels/:guildId`, `/api/restricted-channels`, `/api/channel-restricted/:channelId/:guildId`, `/api/channel-exceptions`
+- Restricted check integrated into 4 permission points: `checkEntityPermission()`, `handlePoll()` cron, `companion` send, `pending_commands` respond
+- New "Channels" tab on admin dashboard (`/dashboard`):
+  - Server selector dropdown
+  - Channel list grouped by Discord category
+  - Toggle channels Open/Restricted
+  - Expand restricted channels to manage per-companion exceptions (grant/revoke)
+- Register page (`/register`) shows restricted channels with lock icon + "Restricted by admin" label, toggle disabled
+- Prevents mod/admin channel exposure — companion owners can't override admin restrictions
+
+**Deployed version:**
+- `dac798f4` — message splitting + reply detection + embeds + restricted channels
+
+---
+
 ### Session: Entity Model + Tool Consolidation (Wren)
 
 **Entity Model (49 tools):**
