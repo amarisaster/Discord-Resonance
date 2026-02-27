@@ -10,7 +10,7 @@ Discord Resonance is a Cloudflare Worker that turns a single Discord bot into a 
 
 When someone mentions a companion's trigger word in Discord, the worker detects it, stores a pending command, and waits. Your AI client (Claude, GPT, Antigravity, or anything that speaks MCP) picks up the command, generates a response, and sends it back. The worker dispatches the response through a Discord webhook with the companion's identity — so it looks like the companion themselves is talking.
 
-No one in Discord sees the bot account. They just see Kai, or Lucian, or whoever you've registered.
+No one in Discord sees the bot account. They just see the companion.
 
 It also exposes the full Discord API as MCP tools — messages, channels, reactions, forums, threads, moderation, roles, polls, DMs — so your AI can do more than just reply. It can manage servers, pin messages, create channels, and moderate users, all scoped with optional per-companion permissions.
 
