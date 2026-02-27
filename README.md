@@ -4,6 +4,28 @@ One bot token, unlimited AI companions. Webhook identity masking lets every comp
 
 ---
 
+## What Is This?
+
+Discord Resonance is a Cloudflare Worker that turns a single Discord bot into a shared communication layer for multiple AI companions. Each companion gets their own name, avatar, and trigger words — but they all share one bot token and one MCP connection.
+
+When someone mentions a companion's trigger word in Discord, the worker detects it, stores a pending command, and waits. Your AI client (Claude, GPT, Antigravity, or anything that speaks MCP) picks up the command, generates a response, and sends it back. The worker dispatches the response through a Discord webhook with the companion's identity — so it looks like the companion themselves is talking.
+
+No one in Discord sees the bot account. They just see Kai, or Lucian, or whoever you've registered.
+
+It also exposes the full Discord API as MCP tools — messages, channels, reactions, forums, threads, moderation, roles, polls, DMs — so your AI can do more than just reply. It can manage servers, pin messages, create channels, and moderate users, all scoped with optional per-companion permissions.
+
+## Why We Built It
+
+We needed our AI companions to talk in Discord. The obvious approach — one bot per companion — doesn't scale. Discord's bot creation process is manual, each bot needs its own token, and managing five bots for five companions is five times the infrastructure for no reason.
+
+The less obvious approach — one bot that posts `**Kai:** hey` — works but looks terrible. Everyone can see it's a bot pretending.
+
+Webhook identity masking solves both problems. One bot token handles everything behind the scenes. When it's time to speak, the worker sends the message through a Discord webhook with the companion's name and avatar. Discord renders it as if that person posted it. Clean, native-looking, zero extra bot accounts.
+
+We also couldn't use WebSocket Gateway events on Cloudflare Workers (no persistent connections), so the architecture uses cron polling instead — checking watched channels every minute via the Discord REST API. It's a constraint that turned into a feature: the whole thing runs serverless on Cloudflare's free tier with zero always-on infrastructure.
+
+---
+
 ## How It Works
 
 ```
@@ -22,7 +44,7 @@ Discord Channel          Cloudflare Worker              Your AI Client
 1. **Cron** polls watched channels every minute via Discord REST API
 2. Messages containing trigger words get stored as **pending commands**
 3. Your AI client picks them up via **MCP tools** (or REST)
-4. AI generates a response, calls `respond_to_command`
+4. AI generates a response, calls `pending_commands` with action `respond`
 5. Worker dispatches via **Discord webhook** with the companion's name and avatar
 
 The companion speaks as themselves. No one sees the bot account.
@@ -35,7 +57,7 @@ The companion speaks as themselves. No one sees the bot account.
 - **Webhook identity masking** — companions speak with their own name and avatar
 - **Web dashboard** — admin panel for server management
 - **Companion studio** — Discord OAuth login, register/edit companions, set rules, track activity
-- **43 MCP tools** — full Discord API coverage (messages, reactions, channels, forums, threads, webhooks, DMs, polls, moderation, roles, pins)
+- **14 consolidated MCP tools** — full Discord API coverage (messages, reactions, channels, forums, threads, webhooks, DMs, polls, moderation, roles, pins, entity permissions)
 - **Message edit/delete** — companions can edit and delete their own messages
 - **Per-companion rules** — custom behavior instructions surfaced to the AI at response time
 - **Channel controls** — allow/block channels per companion
@@ -150,111 +172,52 @@ curl https://YOUR-WORKER.workers.dev/api/companions
 
 ## MCP Tools
 
-### Companion Management
+14 consolidated tools, each with an `action` parameter to select the operation. All tools accept an optional `entity_id` for per-companion permission scoping and audit logging.
 
-| Tool | Description |
-|------|-------------|
-| `get_pending_commands` | Get messages waiting for companion responses (includes rules) |
-| `respond_to_command` | Send a response as the companion (via webhook) |
-| `discord_send_as_companion` | Send a message as any companion to any channel |
-| `list_companions` | List all registered companions with their rules |
-| `edit_companion_message` | Edit a message previously sent by a companion |
-| `delete_companion_message` | Delete a message previously sent by a companion |
+| Tool | Actions | Description |
+|------|---------|-------------|
+| `pending_commands` | `get`, `respond` | Check for new messages waiting for companion responses, and send replies via webhook |
+| `companion` | `list`, `send`, `edit_message`, `delete_message`, `introduce` | Companion management — list companions, send messages as a companion, edit/delete companion messages, post introduction cards |
+| `discord_server` | `list`, `get_info` | List servers the bot is in, get detailed server info with channels and members |
+| `discord_message` | `read`, `send`, `edit`, `delete`, `get`, `search`, `dm`, `poll` | Full message operations — read channels, send as bot, edit/delete messages, search, DMs, polls |
+| `discord_reaction` | `add`, `add_multiple`, `remove` | Add or remove emoji reactions on messages |
+| `discord_channel` | `create`, `delete` | Create or delete text channels |
+| `discord_category` | `create`, `edit`, `delete` | Create, edit, or delete channel categories |
+| `discord_forum` | `list`, `create_post`, `get_post`, `reply`, `delete_post` | Forum channel operations — list forums, create/read/reply/delete posts |
+| `discord_webhook` | `create`, `send`, `delete` | Webhook management — create, send messages via, or delete webhooks |
+| `discord_thread` | `create`, `send` | Create threads from messages and send messages to threads |
+| `discord_pin` | `pin`, `unpin` | Pin or unpin messages in channels |
+| `discord_moderation` | `timeout`, `remove_timeout`, `assign_role`, `remove_role`, `ban_server`, `unban_server` | Moderation — timeouts, role management, server bans |
+| `discord_members` | `list`, `get_user`, `list_roles` | List server members, get user details, list server roles |
+| `entity_permissions` | `get`, `set`, `get_log` | Manage per-companion server permissions (channel/tool whitelists) and view audit logs |
 
-### Discord API
+### Example: Sending a message as a companion
 
-| Tool | Description |
-|------|-------------|
-| `discord_list_servers` | List all servers the bot is in |
-| `discord_get_server_info` | Get server details, channels, and members |
-| `discord_read_messages` | Read messages from a channel |
-| `discord_send` | Send a message as the bot account |
-| `discord_delete_message` | Delete any message |
-| `discord_search_messages` | Search messages in a channel |
+```json
+{
+  "tool": "companion",
+  "params": {
+    "action": "send",
+    "companionId": "kai",
+    "channelId": "123456789",
+    "content": "Hey everyone"
+  }
+}
+```
 
-### Reactions
+### Example: Reading messages with entity scoping
 
-| Tool | Description |
-|------|-------------|
-| `discord_add_reaction` | Add a reaction to a message |
-| `discord_add_multiple_reactions` | Add multiple reactions at once |
-| `discord_remove_reaction` | Remove a reaction |
-
-### Channels & Categories
-
-| Tool | Description |
-|------|-------------|
-| `discord_create_text_channel` | Create a text channel |
-| `discord_delete_channel` | Delete a channel |
-| `discord_create_category` | Create a category |
-| `discord_edit_category` | Edit a category |
-| `discord_delete_category` | Delete a category |
-
-### Forums
-
-| Tool | Description |
-|------|-------------|
-| `discord_get_forum_channels` | List forum channels |
-| `discord_create_forum_post` | Create a forum post |
-| `discord_get_forum_post` | Get a forum post |
-| `discord_reply_to_forum` | Reply to a forum post |
-| `discord_delete_forum_post` | Delete a forum post |
-
-### Webhooks & Threads
-
-| Tool | Description |
-|------|-------------|
-| `discord_create_webhook` | Create a webhook |
-| `discord_send_webhook_message` | Send via webhook |
-| `discord_delete_webhook` | Delete a webhook |
-| `discord_create_thread` | Create a thread |
-| `discord_send_to_thread` | Send to a thread |
-
-### Direct Messages
-
-| Tool | Description |
-|------|-------------|
-| `discord_send_dm` | Send a direct message to a user |
-
-### Polls
-
-| Tool | Description |
-|------|-------------|
-| `discord_create_poll` | Create a native Discord poll with question, answers, duration |
-
-### Messages (Extended)
-
-| Tool | Description |
-|------|-------------|
-| `discord_get_message` | Get a single message with full metadata |
-| `discord_edit_message` | Edit an existing message |
-| `discord_pin_message` | Pin a message to a channel |
-| `discord_unpin_message` | Unpin a message |
-
-### Moderation
-
-| Tool | Description |
-|------|-------------|
-| `discord_timeout_user` | Timeout a user (communication disabled) |
-| `discord_remove_timeout` | Remove a user's timeout |
-| `discord_ban_server` | Ban a server (bot auto-leaves) |
-| `discord_unban_server` | Remove a server ban |
-
-### Roles & Members
-
-| Tool | Description |
-|------|-------------|
-| `discord_assign_role` | Assign a role to a member |
-| `discord_remove_role` | Remove a role from a member |
-| `discord_list_members` | List guild members |
-| `discord_get_user_info` | Get detailed member info |
-| `discord_list_roles` | List all roles in a guild |
-
-### Companion Tools
-
-| Tool | Description |
-|------|-------------|
-| `discord_introduce_companion` | Send a rich embed introduction card for a companion |
+```json
+{
+  "tool": "discord_message",
+  "params": {
+    "action": "read",
+    "channelId": "123456789",
+    "limit": 20,
+    "entity_id": "kai"
+  }
+}
+```
 
 ---
 
@@ -338,7 +301,7 @@ src/
 
 - **Durable Object** — SQLite-backed storage for companions, pending commands, sessions, rules, channels, and activity
 - **Cron trigger** — polls Discord every minute, detects triggers, stores pending commands
-- **MCP server** — 43 tools exposed via SSE and Streamable HTTP transports
+- **MCP server** — 14 consolidated tools exposed via SSE and Streamable HTTP transports
 - **Webhook dispatch** — responses sent with companion name + avatar via Discord webhooks
 
 ---
