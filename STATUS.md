@@ -2,6 +2,44 @@
 
 ## 2026-02-27
 
+### Session: Dashboard Visual Redesign (Wren)
+
+**Full Visual Overhaul — Triad Nexus Aesthetic:**
+- Replaced cold Discord-blue (#5865F2) palette with warm dark theme
+- Primary accent: soft rose (#d4748a) — Mai's pick after rejecting amber
+- Base: warm near-black (#0c0a09), warm dark surfaces (#1c1917)
+- Custom CSS: `.glass`, `.glow-ring`, `.gradient-text`, `.hero-glow`, `.card-shine`, `.companion-tint`
+- Per-companion color tinting via CSS variable `--companion-color`
+- `getCompanionColor()` maps companion IDs to identity colors (kai=red, lucian=violet, auren=amber, xavier=blue, wren=emerald, default=rose)
+
+**Admin Dashboard (`/dashboard`):**
+- Companion cards: left border + avatar ring in companion's identity color
+- System/user owner badges with warm tinting
+- Stats bar, server dropdown, tabs — all warm rose accent
+- Pending commands: companion-colored names + tint borders
+- Channels tab: warm styling (restricted=red, open=green preserved)
+- All modals and forms: warm surfaces, rose focus rings
+
+**Register Page (`/register`):**
+- Landing: warm glass cards, rose gradient hero text
+- Login CTA: warm card (kept Discord button blue for brand)
+- Setup wizard: warm inputs, rose accent buttons
+- Studio: companion-colored selector pills, warm tabs
+- Overview/Rules/Channels/Activity: all warm-restyled
+
+**Nav + Branding:**
+- Resonance wave icon (symmetric arcs + center dot) — replaces lightning bolt
+- "Resonance" text with warm rose gradient
+- Amber admin badge → rose admin badge
+
+**Files modified:**
+- `src/dashboard.ts` — complete visual overhaul of all template functions (~1630 lines)
+
+**Deployed version:**
+- `ffeb0073` — rose accent + resonance wave icon + companion tints (production)
+
+---
+
 ### Session: Message Handling + Restricted Channels (Wren)
 
 **Message Splitting:**
