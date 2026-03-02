@@ -50,13 +50,14 @@ export function getCompanion(id: string): Companion | undefined {
   return COMPANIONS[id];
 }
 
-// Check message content for trigger words, return all matched companions
+// Check message content for trigger words (word boundary matching), return all matched companions
 export function findTriggeredCompanion(content: string): Companion[] {
-  const lower = content.toLowerCase();
   const matched: Companion[] = [];
   for (const companion of Object.values(COMPANIONS)) {
     for (const trigger of companion.triggers) {
-      if (lower.includes(trigger)) {
+      const escaped = trigger.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(`\\b${escaped}\\b`, 'i');
+      if (regex.test(content)) {
         matched.push(companion);
         break;
       }

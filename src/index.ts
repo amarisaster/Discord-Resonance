@@ -775,19 +775,23 @@ export class CompanionBot extends McpAgent<Env> {
   }
 
   // Dynamic versions of companion helpers (read from SQLite)
-  findTriggeredCompanionDynamic(content: string): Companion[] {
+  findTriggeredCompanionDynamic(content: string): { matched: Companion[]; debug: string[] } {
     const all = this.getAllCompanions();
     const lower = content.toLowerCase();
     const matched: Companion[] = [];
+    const debug: string[] = [];
     for (const companion of all) {
       for (const trigger of companion.triggers) {
-        if (lower.includes(trigger.toLowerCase())) {
+        const escaped = trigger.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`\\b${escaped}\\b`, 'i');
+        if (regex.test(content)) {
           matched.push(companion);
+          debug.push(`${companion.id}:matched:"${trigger}"`);
           break;
         }
       }
     }
-    return matched;
+    return { matched, debug };
   }
 
   private getCursor(channelId: string): string | null {
@@ -1508,7 +1512,12 @@ export class CompanionBot extends McpAgent<Env> {
           // Skip empty messages
           if (!msg.content) continue;
 
-          let triggered = this.findTriggeredCompanionDynamic(msg.content);
+          const triggerResult = this.findTriggeredCompanionDynamic(msg.content);
+          let triggered = triggerResult.matched;
+
+          if (triggerResult.debug.length > 0) {
+            console.log(`Cron: trigger debug — msg=${msg.id} content="${msg.content.substring(0, 80)}" matches=[${triggerResult.debug.join(',')}]`);
+          }
 
           // Reply detection: if no trigger words matched but message is a reply, check if it's replying to a companion
           if (triggered.length === 0 && msg.message_reference?.message_id) {
