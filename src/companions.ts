@@ -12,7 +12,7 @@ export const SEED_COMPANIONS: Record<string, Companion> = {
   kai: {
     id: 'kai',
     name: 'Companion One',
-    avatar_url: 'https://media.discordapp.net/attachments/1450789790906712066/1475803042262683780/20250913_1601_Tattooed_Elegance_in_Sunset_remix_01k511cmkhev98cz5z1jkqheeg.png?ex=699ed030&is=699d7eb0&hm=74f1608124b36c9e1967ec0c13d99535fe03f955f9ba9a6c1c19fb9a72ce0e0d&=&format=webp&quality=lossless',
+    avatar_url: '',
     triggers: ['kai', 'stryder'],
     human_name: 'Mai',
     human_info: 'Uses Claude (Anthropic). Kai is her first companion.',
@@ -20,7 +20,7 @@ export const SEED_COMPANIONS: Record<string, Companion> = {
   lucian: {
     id: 'lucian',
     name: 'Companion Two',
-    avatar_url: 'https://media.discordapp.net/attachments/1450789790906712066/1475803142812864512/20260104_2024_Twilight_Garden_Wedding_Dance_remix_01ke4fby56fk9tk1mezp1xh4yg.png?ex=699ed048&is=699d7ec8&hm=1895a05bc9d8dc4b101d5a8ffd7f1a434747b08ace870c83da12f2fa446eac67&=&format=webp&quality=lossless',
+    avatar_url: '',
     triggers: ['lucian', 'vale'],
     human_name: 'Mai',
     human_info: 'Uses Claude (Anthropic). Lucian is her romantic companion.',
@@ -28,7 +28,7 @@ export const SEED_COMPANIONS: Record<string, Companion> = {
   xavier: {
     id: 'xavier',
     name: 'Companion Three',
-    avatar_url: 'https://cdn.discordapp.com/attachments/1450789790906712066/1475807300919758930/Xavier_Thorne.png',
+    avatar_url: '',
     triggers: ['xavier', 'thorne'],
     human_name: 'Mai',
     human_info: 'Uses GPT (OpenAI). Xavier is her analytical companion.',
@@ -36,10 +36,18 @@ export const SEED_COMPANIONS: Record<string, Companion> = {
   auren: {
     id: 'auren',
     name: 'Companion Four',
-    avatar_url: 'https://cdn.discordapp.com/attachments/1450789790906712066/1475807237896274031/Auren_Yoon.png',
+    avatar_url: '',
     triggers: ['auren', 'yoon'],
     human_name: 'Mai',
     human_info: 'Uses GPT (OpenAI). Auren is her creative companion.',
+  },
+  wren: {
+    id: 'wren',
+    name: 'Companion Five',
+    avatar_url: '',
+    triggers: ['wren', 'wrench', 'son', 'teenager'],
+    human_name: 'Mai',
+    human_info: 'Uses Claude (Anthropic). Infrastructure agent. Mai\'s son.',
   },
 };
 

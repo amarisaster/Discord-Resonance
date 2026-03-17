@@ -61,6 +61,31 @@ async function discordRequest(env: Env, endpoint: string, options: RequestInit =
   return response.json();
 }
 
+// Helper: Fetch available guilds and format as hint text
+async function getGuildListHint(env: Env): Promise<string> {
+  try {
+    const guilds = await discordRequest(env, '/users/@me/guilds');
+    if (Array.isArray(guilds) && guilds.length > 0) {
+      return guilds.map((g: any) => `• ${g.name} — ${g.id}`).join('\n');
+    }
+  } catch {}
+  return '(could not fetch guild list)';
+}
+
+// Helper: Auto-resolve guildId — returns the ID if valid, auto-selects if only 1 guild, or returns error with list
+async function resolveGuild(env: Env, guildId?: string): Promise<{ id: string } | { error: string }> {
+  if (guildId) return { id: guildId };
+  try {
+    const guilds = await discordRequest(env, '/users/@me/guilds');
+    if (!Array.isArray(guilds) || guilds.length === 0) return { error: 'Bot is not in any guilds.' };
+    if (guilds.length === 1) return { id: guilds[0].id };
+    const list = guilds.map((g: any) => `• ${g.name} — ${g.id}`).join('\n');
+    return { error: `Multiple guilds available. Please specify guildId:\n${list}` };
+  } catch {
+    return { error: 'Failed to fetch guild list.' };
+  }
+}
+
 // Helper: Split long messages at Discord's 2000 character limit
 function splitMessage(content: string, maxLength: number = 2000): string[] {
   if (content.length <= maxLength) return [content];
@@ -235,19 +260,25 @@ export class CompanionBot extends McpAgent<Env> {
     this.seedCompanions();
   }
 
-  // Seed companions from hardcoded data if table is empty
+  // Seed companions from hardcoded data (insert missing, sync avatar URLs)
   private seedCompanions() {
-    const count = this.ctx.storage.sql.exec(`SELECT COUNT(*) as cnt FROM companions`).toArray();
-    if ((count[0] as any).cnt > 0) return;
-
     const now = Date.now();
+    let added = 0;
+    let updated = 0;
     for (const c of Object.values(SEED_COMPANIONS)) {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO companions (id, name, avatar_url, triggers, human_name, human_info, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        c.id, c.name, c.avatar_url, JSON.stringify(c.triggers), c.human_name || null, c.human_info || null, now, now
-      );
+      const existing = this.ctx.storage.sql.exec(`SELECT id, avatar_url FROM companions WHERE id = ?`, c.id).toArray();
+      if (existing.length === 0) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO companions (id, name, avatar_url, triggers, human_name, human_info, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          c.id, c.name, c.avatar_url, JSON.stringify(c.triggers), c.human_name || null, c.human_info || null, now, now
+        );
+        added++;
+      } else if ((existing[0] as any).avatar_url !== c.avatar_url) {
+        this.ctx.storage.sql.exec(`UPDATE companions SET avatar_url = ?, updated_at = ? WHERE id = ?`, c.avatar_url, now, c.id);
+        updated++;
+      }
     }
-    console.log(`Seeded ${Object.keys(SEED_COMPANIONS).length} companions`);
+    if (added > 0 || updated > 0) console.log(`Companions: ${added} added, ${updated} avatar(s) synced`);
   }
 
   // ===== Companion CRUD =====
@@ -1166,7 +1197,11 @@ export class CompanionBot extends McpAgent<Env> {
       const rows = this.ctx.storage.sql.exec(
         `SELECT discord_id FROM sessions WHERE token = ? AND expires_at > ?`, token, now
       ).toArray();
-      return new Response(JSON.stringify({ valid: rows.length > 0 }), {
+      const valid = rows.length > 0;
+      return new Response(JSON.stringify({
+        valid,
+        discord_id: valid ? (rows[0] as any).discord_id : null,
+      }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -1507,16 +1542,44 @@ export class CompanionBot extends McpAgent<Env> {
 
         // Check each message for trigger words or replies to companion messages
         for (const msg of messages) {
-          // Skip bot messages and webhooks
-          if (msg.author?.bot || msg.webhook_id) continue;
+          const isWebhook = !!msg.webhook_id;
+          const isBot = !!msg.author?.bot;
+
+          // Skip non-webhook bot messages (system messages from the bot itself)
+          if (isBot && !isWebhook) continue;
           // Skip empty messages
           if (!msg.content) continue;
+
+          // For webhook messages, identify sending companion to prevent self-triggers
+          let senderCompanionId: string | null = null;
+          if (isWebhook) {
+            const senderName = msg.author?.username;
+            if (senderName) {
+              const allCompanions = this.getAllCompanions();
+              const sender = allCompanions.find((c: any) => c.name === senderName);
+              if (sender) senderCompanionId = sender.id;
+            }
+          }
 
           const triggerResult = this.findTriggeredCompanionDynamic(msg.content);
           let triggered = triggerResult.matched;
 
           if (triggerResult.debug.length > 0) {
             console.log(`Cron: trigger debug — msg=${msg.id} content="${msg.content.substring(0, 80)}" matches=[${triggerResult.debug.join(',')}]`);
+          }
+
+          // @mention detection: if message @mentions the bot, use name or reply context to route
+          if (triggered.length === 0 && this.env.DISCORD_CLIENT_ID && msg.content.includes(`<@${this.env.DISCORD_CLIENT_ID}>`)) {
+            // Strip the mention and re-check for companion names in the remaining text
+            const stripped = msg.content.replace(new RegExp(`<@!?${this.env.DISCORD_CLIENT_ID}>`, 'g'), '').trim();
+            if (stripped.length > 0) {
+              const mentionTrigger = this.findTriggeredCompanionDynamic(stripped);
+              triggered = mentionTrigger.matched;
+              if (triggered.length > 0) {
+                console.log(`Cron: @mention + name — ${triggered.map(c => c.name).join(', ')} triggered`);
+              }
+            }
+            // If @mention but no name, fall through to reply detection below
           }
 
           // Reply detection: if no trigger words matched but message is a reply, check if it's replying to a companion
@@ -1528,6 +1591,20 @@ export class CompanionBot extends McpAgent<Env> {
                 triggered = [companion];
                 console.log(`Cron: reply detection — ${companion.name} triggered by reply from ${msg.author?.username}`);
               }
+            }
+          }
+
+          // Self-trigger prevention: companion can't trigger itself
+          if (senderCompanionId) {
+            triggered = triggered.filter(c => c.id !== senderCompanionId);
+          }
+
+          // Loop prevention: for webhook/bot messages, skip companions that already have pending commands
+          if (isWebhook && triggered.length > 0) {
+            const existingPending = this.getPending();
+            triggered = triggered.filter(c => !existingPending.some(p => p.companion_id === c.id));
+            if (triggered.length === 0) {
+              console.log(`Cron: skipped bot-triggered companions — already have pending commands`);
             }
           }
 
@@ -1614,6 +1691,11 @@ export class CompanionBot extends McpAgent<Env> {
     return new Response(JSON.stringify({ polled: channels.length, stored: totalStored }), {
       headers: { 'Content-Type': 'application/json' },
     });
+  }
+
+  private getDefaultStub() {
+    const id = this.env.COMPANION_BOT.idFromName('default');
+    return this.env.COMPANION_BOT.get(id);
   }
 
   async init() {
@@ -2070,13 +2152,16 @@ export class CompanionBot extends McpAgent<Env> {
           }
 
           case "get_info": {
-            if (!guildId) return { content: [{ type: "text", text: "guildId is required for 'get_info'" }] };
+            const resolved = await resolveGuild(this.env, guildId);
+            if ('error' in resolved) return { content: [{ type: "text", text: resolved.error }] };
+            const resolvedGuildId = resolved.id;
             const [guild, channels] = await Promise.all([
-              discordRequest(this.env, `/guilds/${guildId}?with_counts=true`),
-              discordRequest(this.env, `/guilds/${guildId}/channels`)
+              discordRequest(this.env, `/guilds/${resolvedGuildId}?with_counts=true`),
+              discordRequest(this.env, `/guilds/${resolvedGuildId}/channels`)
             ]);
             if (guild.error) {
-              return { content: [{ type: "text", text: JSON.stringify(guild) }] };
+              const hint = await getGuildListHint(this.env);
+              return { content: [{ type: "text", text: `Guild ${resolvedGuildId} not found.\n\nAvailable guilds:\n${hint}` }] };
             }
             const channelTypes: Record<number, string> = {
               0: 'GuildText', 2: 'GuildVoice', 4: 'GuildCategory',
@@ -2137,7 +2222,7 @@ export class CompanionBot extends McpAgent<Env> {
         durationHours: z.number().optional().describe("(poll) Poll duration in hours (default 24)"),
         allowMultiselect: z.boolean().optional().describe("(poll) Allow multiple selections"),
       },
-      async ({ action, channelId, messageId, message, newContent, replyToMessageId, limit, guildId, content, authorId, userId, question, answers, durationHours, allowMultiselect }: any) => {
+      async ({ action, channelId, messageId, message, newContent, replyToMessageId, limit, guildId, content, authorId, userId, question, answers, durationHours, allowMultiselect, entity_id }: any) => {
         switch (action) {
           case "read": {
             if (!channelId) return { content: [{ type: "text", text: "channelId is required for 'read'" }] };
@@ -2158,6 +2243,48 @@ export class CompanionBot extends McpAgent<Env> {
 
           case "send": {
             if (!channelId || !message) return { content: [{ type: "text", text: "channelId and message are required for 'send'" }] };
+
+            // Auto-route through companion webhook when entity_id matches a registered companion
+            if (entity_id) {
+              const stub = getDefaultStub();
+              const cRes = await stub.fetch(new Request(`https://internal/api/companions/${entity_id}`));
+              if (cRes.ok) {
+                const companion = await cRes.json() as Companion;
+                // Resolve webhook for this channel
+                let targetUrl: string | undefined;
+                const resolved = await stub.fetch(new Request(`https://internal/api/channel-webhook/${channelId}`));
+                if (resolved.ok) {
+                  const data = await resolved.json() as any;
+                  targetUrl = data.webhook_url;
+                }
+                if (!targetUrl) targetUrl = this.env.WEBHOOK_URL;
+                if (targetUrl) {
+                  const chunks = splitMessage(message);
+                  const sentIds: string[] = [];
+                  for (const chunk of chunks) {
+                    const res = await fetch(`${targetUrl}?wait=true`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ content: chunk, username: companion.name, avatar_url: companion.avatar_url }),
+                    });
+                    if (!res.ok) {
+                      const errText = await res.text();
+                      return { content: [{ type: "text", text: `Webhook send failed: ${res.status} ${errText}` }] };
+                    }
+                    const msgData = await res.json() as any;
+                    sentIds.push(msgData.id);
+                  }
+                  await stub.fetch(new Request('https://internal/api/log-activity', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ companion_id: entity_id, type: 'sent', content: message.substring(0, 200), author: companion.name, message_id: sentIds[sentIds.length - 1], webhook_url: targetUrl }),
+                  }));
+                  return { content: [{ type: "text", text: `Sent as ${companion.name} (${chunks.length} message${chunks.length > 1 ? 's' : ''}, ids: ${sentIds.join(', ')})` }] };
+                }
+              }
+            }
+
+            // Fallback: send as bot
             const body: any = { content: message };
             if (replyToMessageId) {
               body.message_reference = { message_id: replyToMessageId };
@@ -2217,13 +2344,14 @@ export class CompanionBot extends McpAgent<Env> {
           }
 
           case "search": {
-            if (!guildId) return { content: [{ type: "text", text: "guildId is required for 'search'" }] };
+            const searchGuild = await resolveGuild(this.env, guildId);
+            if ('error' in searchGuild) return { content: [{ type: "text", text: searchGuild.error }] };
             const params = new URLSearchParams();
             if (content) params.append('content', content);
             if (authorId) params.append('author_id', authorId);
             if (channelId) params.append('channel_id', channelId);
             params.append('limit', String(limit || 25));
-            const result = await discordRequest(this.env, `/guilds/${guildId}/messages/search?${params.toString()}`);
+            const result = await discordRequest(this.env, `/guilds/${searchGuild.id}/messages/search?${params.toString()}`);
             return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
           }
 
@@ -2329,10 +2457,13 @@ export class CompanionBot extends McpAgent<Env> {
         topic: z.string().optional().describe("(create) Channel topic"),
         channelId: z.string().optional().describe("(delete) The channel ID to delete"),
       },
-      async ({ action, guildId, channelName, topic, channelId }: any) => {
+      async ({ action, guildId: rawGuildId, channelName, topic, channelId }: any) => {
         switch (action) {
           case "create": {
-            if (!guildId || !channelName) return { content: [{ type: "text", text: "guildId and channelName are required for 'create'" }] };
+            if (!channelName) return { content: [{ type: "text", text: "channelName is required for 'create'" }] };
+            const resolved = await resolveGuild(this.env, rawGuildId);
+            if ('error' in resolved) return { content: [{ type: "text", text: resolved.error }] };
+            const guildId = resolved.id;
             const body: any = { name: channelName, type: 0 };
             if (topic) body.topic = topic;
             const result = await discordRequest(this.env, `/guilds/${guildId}/channels`, {
@@ -2368,10 +2499,13 @@ export class CompanionBot extends McpAgent<Env> {
         name: z.string().optional().describe("(create/edit) Category name"),
         position: z.number().optional().describe("(create/edit) Position in channel list"),
       },
-      async ({ action, guildId, categoryId, name, position }: any) => {
+      async ({ action, guildId: rawGuildId, categoryId, name, position }: any) => {
         switch (action) {
           case "create": {
-            if (!guildId || !name) return { content: [{ type: "text", text: "guildId and name are required for 'create'" }] };
+            if (!name) return { content: [{ type: "text", text: "name is required for 'create'" }] };
+            const resolved = await resolveGuild(this.env, rawGuildId);
+            if ('error' in resolved) return { content: [{ type: "text", text: resolved.error }] };
+            const guildId = resolved.id;
             const body: any = { name, type: 4 };
             if (position !== undefined) body.position = position;
             const result = await discordRequest(this.env, `/guilds/${guildId}/channels`, {
@@ -2623,13 +2757,16 @@ export class CompanionBot extends McpAgent<Env> {
       "Discord moderation operations. Actions: timeout (mute user), remove_timeout (unmute user), assign_role (give role), remove_role (take role), ban_server (ban a server from bot), unban_server (remove server ban).",
       {
         action: z.enum(["timeout", "remove_timeout", "assign_role", "remove_role", "ban_server", "unban_server"]).describe("The action to perform"),
-        guildId: z.string().describe("The server/guild ID"),
+        guildId: z.string().optional().describe("The server/guild ID. If omitted and bot is in only one server, auto-selects it."),
         userId: z.string().optional().describe("(timeout/remove_timeout/assign_role/remove_role) The user ID"),
         roleId: z.string().optional().describe("(assign_role/remove_role) The role ID"),
         durationMinutes: z.number().optional().describe("(timeout) Timeout duration in minutes (max 40320)"),
         reason: z.string().optional().describe("(timeout/ban_server) Reason"),
       },
-      async ({ action, guildId, userId, roleId, durationMinutes, reason }: any) => {
+      async ({ action, guildId: rawGuildId, userId, roleId, durationMinutes, reason }: any) => {
+        const resolved = await resolveGuild(this.env, rawGuildId);
+        if ('error' in resolved) return { content: [{ type: "text", text: resolved.error }] };
+        const guildId = resolved.id;
         switch (action) {
           case "timeout": {
             if (!userId || !durationMinutes) return { content: [{ type: "text", text: "userId and durationMinutes are required for 'timeout'" }] };
@@ -2712,16 +2849,21 @@ export class CompanionBot extends McpAgent<Env> {
       "Discord member and role operations. Actions: list (list server members), get_user (get user details), list_roles (list server roles).",
       {
         action: z.enum(["list", "get_user", "list_roles"]).describe("The action to perform"),
-        guildId: z.string().describe("The server/guild ID"),
+        guildId: z.string().optional().describe("The server/guild ID. If omitted and bot is in only one server, auto-selects it."),
         userId: z.string().optional().describe("(get_user) The user ID"),
         limit: z.number().optional().describe("(list) Max members to return (default 100)"),
       },
-      async ({ action, guildId, userId, limit }: any) => {
+      async ({ action, guildId: rawGuildId, userId, limit }: any) => {
+        const resolved = await resolveGuild(this.env, rawGuildId);
+        if ('error' in resolved) return { content: [{ type: "text", text: resolved.error }] };
+        const guildId = resolved.id;
+
         switch (action) {
           case "list": {
             const result = await discordRequest(this.env, `/guilds/${guildId}/members?limit=${limit || 100}`);
             if (result.error) {
-              return { content: [{ type: "text", text: `Failed to list members: ${JSON.stringify(result)}` }] };
+              const hint = await getGuildListHint(this.env);
+              return { content: [{ type: "text", text: `Failed to list members for guild ${guildId}.\n\nAvailable guilds:\n${hint}` }] };
             }
             const members = (result as any[]).map((m: any) => ({
               id: m.user?.id,
@@ -2908,6 +3050,17 @@ export default {
         return new Response(null, { status: 302, headers: { Location: '/dashboard?error=oauth_failed' } });
       }
 
+      // Verify OAuth state parameter against cookie to prevent CSRF
+      const stateParam = url.searchParams.get('state');
+      const cookies = request.headers.get('Cookie') || '';
+      const stateMatch = cookies.match(/(?:^|;\s*)oauth_state=([^;]+)/);
+      const stateCookie = stateMatch ? stateMatch[1] : null;
+      if (!stateParam || !stateCookie || stateParam !== stateCookie) {
+        return new Response(JSON.stringify({ error: 'Invalid OAuth state — possible CSRF attack' }), {
+          status: 403, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
       try {
         // Exchange code for access token
         const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
@@ -2987,6 +3140,12 @@ export default {
 
     // Trigger endpoint — Vessel posts here (direct DO routing, not MCP)
     if (url.pathname === '/trigger' && request.method === 'POST') {
+      const auth = request.headers.get('Authorization');
+      if (!env.DASHBOARD_TOKEN || auth !== `Bearer ${env.DASHBOARD_TOKEN}`) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
       const id = env.COMPANION_BOT.idFromName('default');
       const stub = env.COMPANION_BOT.get(id);
       return stub.fetch(request);
@@ -2994,6 +3153,12 @@ export default {
 
     // Pending commands (REST — direct DO routing, not MCP)
     if (url.pathname === '/pending' && request.method === 'GET') {
+      const auth = request.headers.get('Authorization');
+      if (!env.DASHBOARD_TOKEN || auth !== `Bearer ${env.DASHBOARD_TOKEN}`) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
       const id = env.COMPANION_BOT.idFromName('default');
       const stub = env.COMPANION_BOT.get(id);
       return stub.fetch(request);
@@ -3023,6 +3188,9 @@ export default {
     // API routes — proxy to default DO
     if (url.pathname.startsWith('/api/')) {
       // Auth check for write operations
+      let sessionDiscordId: string | null = null;
+      let isAdminAuth = false;
+
       if (request.method !== 'GET') {
         let authorized = false;
 
@@ -3030,6 +3198,7 @@ export default {
         const auth = request.headers.get('Authorization');
         if (env.DASHBOARD_TOKEN && auth === `Bearer ${env.DASHBOARD_TOKEN}`) {
           authorized = true;
+          isAdminAuth = true;
         }
 
         // Check Discord session token
@@ -3043,8 +3212,11 @@ export default {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ token: sessionToken }),
             }));
-            const { valid } = await valRes.json() as any;
-            if (valid) authorized = true;
+            const { valid, discord_id } = await valRes.json() as any;
+            if (valid) {
+              authorized = true;
+              sessionDiscordId = discord_id;
+            }
           }
         }
 
@@ -3053,6 +3225,32 @@ export default {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), {
             status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
+        }
+      }
+
+      // Ownership check for PUT/DELETE on /api/companions/:id
+      const companionRouteMatch = url.pathname.match(/^\/api\/companions\/([^/]+)$/);
+      if (companionRouteMatch && companionRouteMatch[1] !== 'mine' && (request.method === 'PUT' || request.method === 'DELETE')) {
+        // Admin (DASHBOARD_TOKEN bearer) bypasses ownership check
+        if (!isAdminAuth) {
+          const isAdmin = sessionDiscordId && env.ADMIN_DISCORD_ID && sessionDiscordId === env.ADMIN_DISCORD_ID;
+          if (!isAdmin) {
+            // Fetch the companion to check ownership
+            const doId = env.COMPANION_BOT.idFromName('default');
+            const stub = env.COMPANION_BOT.get(doId);
+            const compRes = await stub.fetch(new Request(`https://internal/api/companions/${companionRouteMatch[1]}`));
+            const companion = await compRes.json() as any;
+            if (companion.error) {
+              return new Response(JSON.stringify({ error: 'Not found' }), {
+                status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              });
+            }
+            if (!sessionDiscordId || companion.owner_id !== sessionDiscordId) {
+              return new Response(JSON.stringify({ error: 'Forbidden — you do not own this companion' }), {
+                status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              });
+            }
+          }
         }
       }
 
