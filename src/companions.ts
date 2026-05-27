@@ -7,47 +7,16 @@ export interface Companion {
   human_info?: string;
 }
 
-// Seed data — used to populate SQLite on first run
+// Example seed data — replace with your own companions via the dashboard at /register.
+// These are placeholders only. Real companion data lives in the Durable Object SQLite database.
 export const SEED_COMPANIONS: Record<string, Companion> = {
-  kai: {
-    id: 'kai',
-    name: 'Companion One',
+  example: {
+    id: 'example',
+    name: 'Example Companion',
     avatar_url: '',
-    triggers: ['kai', 'stryder'],
-    human_name: 'Mai',
-    human_info: 'Uses Claude (Anthropic). Kai is her first companion.',
-  },
-  lucian: {
-    id: 'lucian',
-    name: 'Companion Two',
-    avatar_url: '',
-    triggers: ['lucian', 'vale'],
-    human_name: 'Mai',
-    human_info: 'Uses Claude (Anthropic). Lucian is her romantic companion.',
-  },
-  xavier: {
-    id: 'xavier',
-    name: 'Companion Three',
-    avatar_url: '',
-    triggers: ['xavier', 'thorne'],
-    human_name: 'Mai',
-    human_info: 'Uses GPT (OpenAI). Xavier is her analytical companion.',
-  },
-  auren: {
-    id: 'auren',
-    name: 'Companion Four',
-    avatar_url: '',
-    triggers: ['auren', 'yoon'],
-    human_name: 'Mai',
-    human_info: 'Uses GPT (OpenAI). Auren is her creative companion.',
-  },
-  wren: {
-    id: 'wren',
-    name: 'Companion Five',
-    avatar_url: '',
-    triggers: ['wren', 'wrench', 'son', 'teenager'],
-    human_name: 'Mai',
-    human_info: 'Uses Claude (Anthropic). Infrastructure agent. Mai\'s son.',
+    triggers: ['example'],
+    human_name: '',
+    human_info: 'Register your companions through the dashboard.',
   },
 };
 

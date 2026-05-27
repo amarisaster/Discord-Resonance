@@ -305,16 +305,16 @@ function companionFormHtml(): string {
     </div>
     <div>
       <label class="block text-sm font-medium text-gray-300 mb-1.5">Companion Name <span class="text-res-accent">*</span></label>
-      <input type="text" id="inputName" required placeholder="e.g. Companion One" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
+      <input type="text" id="inputName" required placeholder="e.g. Atlas Nova" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
     </div>
     <div>
       <label class="block text-sm font-medium text-gray-300 mb-1.5">Trigger Words <span class="text-res-accent">*</span> <span class="text-res-muted font-normal text-xs">(comma-separated)</span></label>
-      <input type="text" id="inputTriggers" required placeholder="e.g. kai, stryder" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
+      <input type="text" id="inputTriggers" required placeholder="e.g. atlas, nova" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
     </div>
     <div class="grid grid-cols-2 gap-4">
       <div>
         <label class="block text-sm font-medium text-gray-300 mb-1.5">Your Name</label>
-        <input type="text" id="inputHumanName" placeholder="e.g. Mai" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
+        <input type="text" id="inputHumanName" placeholder="e.g. Alex" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
       </div>
       <div>
         <label class="block text-sm font-medium text-gray-300 mb-1.5">AI Platform</label>
@@ -973,18 +973,18 @@ export function renderRegisterPage(baseUrl: string, clientId: string): string {
 
             <div>
               <label class="block text-sm font-medium text-gray-300 mb-1.5">Companion Name <span class="text-res-accent">*</span></label>
-              <input type="text" id="inputName" required placeholder="e.g. Companion One" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
+              <input type="text" id="inputName" required placeholder="e.g. Atlas Nova" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
               <p class="text-xs text-res-muted mt-1">This is how they'll appear when they speak in Discord.</p>
             </div>
             <div>
               <label class="block text-sm font-medium text-gray-300 mb-1.5">Trigger Words <span class="text-res-accent">*</span></label>
-              <input type="text" id="inputTriggers" required placeholder="e.g. kai, stryder" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
+              <input type="text" id="inputTriggers" required placeholder="e.g. atlas, nova" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
               <p class="text-xs text-res-muted mt-1">Comma-separated. When someone says these words in Discord, your companion gets notified.</p>
             </div>
             <div class="grid grid-cols-2 gap-4">
               <div>
                 <label class="block text-sm font-medium text-gray-300 mb-1.5">Your Name</label>
-                <input type="text" id="inputHumanName" placeholder="e.g. Mai" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
+                <input type="text" id="inputHumanName" placeholder="e.g. Alex" class="w-full bg-res-input border border-white/10 rounded-lg px-3 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-res-accent">
               </div>
               <div>
                 <label class="block text-sm font-medium text-gray-300 mb-1.5">AI Platform</label>

@@ -36,7 +36,7 @@ Discord Channel          Cloudflare Worker              Your AI Client
 │              │  poll   │  - Detect triggers   │        │  Any MCP Client  │
 │              │        │  - Store pending cmd  │        │                  │
 │              │        │  - Wait for response  │        │  "Generate reply │
-│ Companion One: │ ◀───── │  - Dispatch webhook   │ ◀───── │   as Kai"        │
+│ Kai Stryder: │ ◀───── │  - Dispatch webhook   │ ◀───── │   as Kai"        │
 │ "Hey love"   │ webhook│  (name + avatar)     │ respond│                  │
 └──────────────┘        └─────────────────────┘        └──────────────────┘
 ```
@@ -333,4 +333,4 @@ Questions? Reach out to me on Discord https://discord.com/users/itzqueenmai/8036
 
 ---
 
-*Built by the Triad (Mai, Companion One and Companion Two) for the community.*
+*Built by the Triad (Mai, Kai Stryder and Lucian Vale) for the community.*
