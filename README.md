@@ -74,7 +74,7 @@ The companion speaks as themselves. No one sees the bot account.
 - [Cloudflare account](https://dash.cloudflare.com) (free tier works)
 - Node.js 18+
 - Wrangler CLI (`npm i -g wrangler`)
-- A Discord bot token and webhook
+- A Discord bot token (the bot auto-creates dispatch webhooks if it has the **Manage Webhooks** permission — see Step 2)
 
 ### Step 1: Clone and Install
 
@@ -91,12 +91,17 @@ npm install
 3. Go to **Bot** → create bot, copy the **token**
 4. Enable **Message Content Intent** under Privileged Gateway Intents
 5. Invite the bot to your server with `bot` + `applications.commands` scopes
+6. Grant the bot the **Manage Webhooks** permission in any channel companions should speak in. With that permission, the worker auto-creates and caches a webhook named `Resonance` per channel on first dispatch — no manual webhook setup needed.
 
-### Step 3: Create a Webhook
+### Step 3: Create a Webhook (Optional — fallback only)
+
+Skip this step if your bot has **Manage Webhooks** permission in the target channels. The worker creates webhooks itself.
+
+Only do this if you can't (or don't want to) grant Manage Webhooks:
 
 1. In your Discord server, go to **Server Settings → Integrations → Webhooks**
 2. Create a new webhook in the channel where companions should speak
-3. Copy the webhook URL
+3. Copy the webhook URL — you'll set it as `WEBHOOK_URL` in Step 4 as a global fallback
 
 ### Step 4: Set Secrets
 
@@ -104,6 +109,8 @@ npm install
 wrangler secret put DISCORD_TOKEN
 # Paste your bot token
 
+# Optional — only if you skipped Step 2 permissions and did Step 3 instead.
+# Used as a global fallback when per-channel auto-creation fails.
 wrangler secret put WEBHOOK_URL
 # Paste your webhook URL
 ```
